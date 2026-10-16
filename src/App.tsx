@@ -1,4 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
+import type { Session } from "@supabase/supabase-js";
+import { supabase, loadProgress, saveProgress } from "./lib/supabase";
+import Auth from "./Auth";
 import "./enhancements.css";
 
 type IconName =
@@ -82,7 +85,10 @@ function Badge({ children, tone = "green" }: { children: ReactNode; tone?: "gree
 }
 
 function App() {
-  const [entry, setEntry] = useState<"landing" | "setup" | "app">("landing");
+  const [entry, setEntry] = useState<"landing" | "auth" | "setup" | "app">("landing");
+  const [authMode, setAuthMode] = useState<"signin" | "signup">("signin");
+  const [session, setSession] = useState<Session | null>(null);
+  const userId = session?.user.id;
   const [active, setActive] = useState("Dashboard");
   const [score, setScore] = useState(72);
   const [scoreOpen, setScoreOpen] = useState(false);
@@ -90,11 +96,39 @@ function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [notifications, setNotifications] = useState(false);
 
+  // Keep the session in sync with Supabase (sign in, sign out, page reloads).
+  useEffect(() => {
+    if (!supabase) return;
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data } = supabase.auth.onAuthStateChange((_event, s) => setSession(s));
+    return () => data.subscription.unsubscribe();
+  }, []);
+
+  // When a user signs in, load their saved progress. New users go to household setup.
+  useEffect(() => {
+    if (!userId) return;
+    loadProgress(userId).then((saved) => {
+      if (saved) { setScore(saved.score); setComplete(saved.completed_tasks); setEntry("app"); }
+      else setEntry("setup");
+    });
+  }, [userId]);
+
+  const signOut = async () => {
+    await supabase?.auth.signOut();
+    setScore(72); setComplete([]); setActive("Dashboard"); setEntry("landing");
+  };
+
+  const finishSetup = (household: string[]) => {
+    if (userId) saveProgress(userId, { score, completed_tasks: complete, household });
+    setEntry("app");
+  };
+
   const completeTask = (title: string, points: number) => {
     if (complete.includes(title)) return;
     setComplete((v) => [...v, title]);
     let current = score;
     const target = Math.min(score + points, 100);
+    if (userId) saveProgress(userId, { score: target, completed_tasks: [...complete, title] });
     const timer = window.setInterval(() => {
       current += 1;
       setScore(current);
@@ -104,8 +138,11 @@ function App() {
 
   const go = (name: string) => { setActive(name); setMenuOpen(false); window.scrollTo({ top: 0, behavior: "smooth" }); };
 
-  if (entry === "landing") return <Landing onStart={() => setEntry("setup")} onExplore={() => setEntry("app")}/>;
-  if (entry === "setup") return <HouseholdSetup onComplete={() => setEntry("app")}/>;
+  const openAuth = (mode: "signin" | "signup") => { setAuthMode(mode); setEntry("auth"); };
+
+  if (entry === "landing") return <Landing onStart={() => userId ? setEntry("setup") : openAuth("signup")} onSignIn={() => userId ? setEntry("app") : openAuth("signin")} onExplore={() => setEntry("app")}/>;
+  if (entry === "auth") return <Auth initialMode={authMode} onBack={() => setEntry("landing")}/>;
+  if (entry === "setup") return <HouseholdSetup onComplete={finishSetup}/>;
 
   return <div className="app">
     <aside className={`sidebar ${menuOpen ? "open" : ""}`}>
@@ -122,7 +159,9 @@ function App() {
           <Badge tone="orange"><span className="status-dot"/> MODERATE RISK</Badge>
           <button className="icon-button" aria-label="Help"><Icon name="help"/></button>
           <button className="icon-button notify" aria-label="Notifications" onClick={() => setNotifications(!notifications)}><Icon name="bell"/><i/></button>
-          <div className="avatar">BR</div>
+          {session
+            ? <><div className="avatar" title={session.user.email}>{(session.user.email ?? "?").slice(0, 2).toUpperCase()}</div><button className="text-button" onClick={signOut}>Sign out</button></>
+            : <button className="text-button" onClick={() => openAuth("signin")}>Sign in</button>}
         </div>
         {notifications && <NotificationPanel onClose={() => setNotifications(false)}/>}
       </header>
@@ -147,21 +186,21 @@ function App() {
   </div>;
 }
 
-function Landing({onStart,onExplore}:{onStart:()=>void;onExplore:()=>void}) {
+function Landing({onStart,onSignIn,onExplore}:{onStart:()=>void;onSignIn:()=>void;onExplore:()=>void}) {
   return <div className="landing">
-    <header className="landing-header"><div className="brand"><div className="brand-mark"><Icon name="flame"/></div><div><b>ReadyCA</b><small>WILDFIRE READINESS</small></div></div><div><button className="text-button">How it works</button><button className="text-button">Preparedness resources</button><Button variant="secondary" onClick={onExplore}>Sign in</Button></div></header>
+    <header className="landing-header"><div className="brand"><div className="brand-mark"><Icon name="flame"/></div><div><b>ReadyCA</b><small>WILDFIRE READINESS</small></div></div><div><button className="text-button">How it works</button><button className="text-button">Preparedness resources</button><Button variant="secondary" onClick={onSignIn}>Sign in</Button></div></header>
     <main className="landing-main"><section className="landing-copy"><Badge tone="orange"><span className="status-dot"/> BUILT FOR CALIFORNIA HOUSEHOLDS</Badge><h1>Be ready before wildfire conditions change.</h1><p>Understand your household's readiness, build a clear evacuation plan, and take the next best step with guidance grounded in trusted emergency sources.</p><div className="landing-actions"><Button onClick={onStart}>Build my readiness plan <Icon name="arrow"/></Button><Button variant="secondary" onClick={onExplore}>Explore the dashboard</Button></div><div className="trust-row"><span><Icon name="shield"/> Evidence-grounded</span><span><Icon name="check"/> Transparent scoring</span><span><Icon name="pin"/> Location-aware</span></div></section>
     <section className="landing-preview"><div className="preview-alert"><span><Icon name="flame"/></span><div><small>LOCAL WILDFIRE RISK</small><b>Moderate</b><p>No active evacuation order near your location.</p></div></div><div className="preview-score"><ScoreRing score={72}/><div><Badge>GOOD PREPAREDNESS</Badge><h2>Your household has a good start.</h2><p>Complete your evacuation plan to improve your score by 8 points.</p><div className="progress"><i style={{width:"72%"}}/></div></div></div><div className="preview-actions"><span><Icon name="route"/> Create evacuation plan <b>+8</b></span><span><Icon name="box"/> Prepare 72-hour kit <b>+6</b></span></div></section></main>
     <footer className="landing-footer"><span><Icon name="shield"/> In an emergency, follow official local instructions. Call 911 for life-threatening emergencies.</span><span>Guidance informed by CAL FIRE · Cal OES · FEMA · Ready.gov</span></footer>
   </div>;
 }
 
-function HouseholdSetup({onComplete}:{onComplete:()=>void}) {
+function HouseholdSetup({onComplete}:{onComplete:(household:string[])=>void}) {
   const [step,setStep]=useState(0);
   const steps=[["Your household","Tell us who you are preparing for.",["2 adults","1 child","1 older adult","Accessibility needs"]],["Pets & transportation","Plan for everyone and every way out.",["1 dog","Pet carrier ready","2 vehicles","Fuel above half"]],["Communication","Make sure your household can reconnect.",["Primary phone added","Emergency contact","Out-of-area contact","Text alerts preferred"]]] as const;
   const [selected,setSelected]=useState<string[]>(["2 adults","1 child","1 dog","2 vehicles"]);
   const current=steps[step];
-  return <div className="setup-page"><header><div className="brand"><div className="brand-mark"><Icon name="flame"/></div><div><b>ReadyCA</b><small>HOUSEHOLD SETUP</small></div></div><button className="text-button" onClick={onComplete}>Save & finish later</button></header><main><div className="setup-progress"><span>STEP {step+1} OF {steps.length}</span><div>{steps.map((_,i)=><i className={i<=step?"active":""} key={i}/>)}</div></div><Badge tone="blue">USER-PROVIDED INFORMATION</Badge><h1>{current[0]}</h1><p>{current[1]} You can update these details at any time.</p><div className="setup-options">{current[2].map((x,i)=><button className={selected.includes(x)?"selected":""} onClick={()=>setSelected(v=>v.includes(x)?v.filter(y=>y!==x):[...v,x])} key={x}><span><Icon name={(["users","users","pet","car"] as IconName[])[i]}/></span><b>{x}</b><i>{selected.includes(x)&&<Icon name="check"/>}</i></button>)}</div><div className="setup-insight"><Icon name="spark"/><div><b>Why we ask</b><span>These details shape your evacuation timing, supply list, transportation plan, and priority recommendations. ReadyCA does not infer sensitive characteristics.</span></div></div><div className="setup-actions"><Button variant="secondary" onClick={()=>setStep(Math.max(0,step-1))} disabled={step===0}>Back</Button><Button onClick={()=>step<steps.length-1?setStep(step+1):onComplete()}>{step===steps.length-1?"View my readiness dashboard":"Continue"} <Icon name="arrow"/></Button></div></main></div>;
+  return <div className="setup-page"><header><div className="brand"><div className="brand-mark"><Icon name="flame"/></div><div><b>ReadyCA</b><small>HOUSEHOLD SETUP</small></div></div><button className="text-button" onClick={()=>onComplete(selected)}>Save & finish later</button></header><main><div className="setup-progress"><span>STEP {step+1} OF {steps.length}</span><div>{steps.map((_,i)=><i className={i<=step?"active":""} key={i}/>)}</div></div><Badge tone="blue">USER-PROVIDED INFORMATION</Badge><h1>{current[0]}</h1><p>{current[1]} You can update these details at any time.</p><div className="setup-options">{current[2].map((x,i)=><button className={selected.includes(x)?"selected":""} onClick={()=>setSelected(v=>v.includes(x)?v.filter(y=>y!==x):[...v,x])} key={x}><span><Icon name={(["users","users","pet","car"] as IconName[])[i]}/></span><b>{x}</b><i>{selected.includes(x)&&<Icon name="check"/>}</i></button>)}</div><div className="setup-insight"><Icon name="spark"/><div><b>Why we ask</b><span>These details shape your evacuation timing, supply list, transportation plan, and priority recommendations. ReadyCA does not infer sensitive characteristics.</span></div></div><div className="setup-actions"><Button variant="secondary" onClick={()=>setStep(Math.max(0,step-1))} disabled={step===0}>Back</Button><Button onClick={()=>step<steps.length-1?setStep(step+1):onComplete(selected)}>{step===steps.length-1?"View my readiness dashboard":"Continue"} <Icon name="arrow"/></Button></div></main></div>;
 }
 
 function Dashboard({ score, complete, openScore, completeTask, go }: { score: number; complete: string[]; openScore: () => void; completeTask: (t: string, p: number) => void; go: (n: string) => void }) {
