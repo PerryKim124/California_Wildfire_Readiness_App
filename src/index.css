@@ -8,3 +8,50 @@
 
 /* Login / sign-up screen */
 .auth-page{min-height:100vh;display:grid;place-items:center;padding:24px 16px;background:#f4f3ef}.auth-card{width:100%;max-width:400px;background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:28px;display:flex;flex-direction:column;gap:14px;box-shadow:0 10px 30px rgba(23,37,31,.06)}.auth-card h1{margin:10px 0 0;font-size:24px;color:var(--ink)}.auth-card p{margin:0;color:var(--muted);font-size:14px}.auth-card label{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:600;color:var(--ink)}.auth-card input{font:inherit;font-weight:400;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:#fff;color:var(--ink)}.auth-card input:focus{outline:2px solid var(--green);outline-offset:1px;border-color:var(--green)}.auth-card .btn{justify-content:center;margin-top:4px}.auth-card .text-button{align-self:center}.auth-card .brand-mark{display:grid;place-items:center}.auth-message{font-size:13px;padding:10px 12px;border-radius:10px}.auth-message.error{background:var(--orange-2);color:var(--orange)}.auth-message.info{background:var(--green-2);color:var(--green)}.auth-message code{font-size:12px}
+
+/* Settings → account card */
+.account-card{display:flex;align-items:center;gap:16px;padding:20px;margin-bottom:16px}.account-card>.avatar{flex:none;width:48px;height:48px;font-size:16px}.account-card>div{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}.account-card small{color:var(--muted);font-size:13px}.account-fields label{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:600;color:var(--ink)}.account-fields input{font:inherit;font-weight:400;padding:10px 12px;border:1px solid var(--line);border-radius:10px;max-width:360px;color:var(--ink)}.account-fields input:focus{outline:2px solid var(--green);outline-offset:1px;border-color:var(--green)}.account-fields .auth-message{align-self:flex-start;padding:6px 10px}
+@media(max-width:760px){.account-card{flex-wrap:wrap}.account-card>.btn{width:100%;justify-content:center}}
+button.avatar{border:0;cursor:pointer;font-family:inherit}
+
+/* Household data entry (per-account household profile) */
+button.location{border:0;background:none;padding:4px 6px;margin:-4px -6px;border-radius:10px;font:inherit;color:inherit;text-align:left;cursor:pointer}button.location:hover{background:#f0f3ef}
+.hh-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px 12px;align-items:end;margin:10px 0}
+.hh-form label{display:flex;flex-direction:column;gap:5px;font-size:12px;font-weight:600;color:var(--ink);min-width:0}
+.hh-form input,.hh-form select{font:inherit;font-size:13px;font-weight:400;padding:9px 10px;border:1px solid var(--line);border-radius:9px;background:#fff;color:var(--ink);width:100%;min-width:0}
+.hh-form input:disabled{background:#f4f5f2;color:var(--muted)}
+.hh-form input:focus,.hh-form select:focus{outline:2px solid var(--green);outline-offset:1px;border-color:var(--green)}
+.hh-form .hh-wide{grid-column:1/-1}
+.hh-form-actions{grid-column:1/-1;display:flex;justify-content:flex-end;gap:8px}
+.hh-form-actions .btn{font-size:13px}
+.hh-remove{position:absolute;top:8px;right:8px;width:26px;height:26px;border-radius:50%;border:1px solid var(--line);background:#fff;color:var(--muted);display:grid;place-items:center;cursor:pointer;z-index:1}
+.hh-remove:hover{color:var(--orange);border-color:var(--orange)}
+.pet-card,.vehicle-card,.person-card{position:relative}
+.person-card.editing,.pet-card.editing,.vehicle-card.editing{grid-column:1/-1}
+.person-card.editing h4,.pet-card.editing h4,.vehicle-card.editing h4,.hh-inline h4{margin:0 0 4px;font-size:14px}
+.hh-empty{display:flex;gap:12px;align-items:center;padding:16px;border:1px dashed var(--line);border-radius:12px;color:var(--muted);margin:12px 0}
+.hh-empty>div{display:flex;flex-direction:column;gap:2px}.hh-empty b{color:var(--ink);font-size:14px}.hh-empty span{font-size:13px}
+.hh-list{list-style:none;margin:12px 0;padding:0;display:flex;flex-direction:column;gap:8px}
+.hh-list li{position:relative;display:flex;align-items:center;gap:10px;padding:10px 44px 10px 10px;border:1px solid var(--line);border-radius:10px;background:#fff}
+.hh-list li>div{display:flex;flex-direction:column;min-width:0}.hh-list b{font-size:13px}.hh-list small{font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.hh-list .hh-remove{top:50%;transform:translateY(-50%)}
+.hh-list-initials{flex:none;width:30px;height:30px;border-radius:50%;background:var(--green-2);color:var(--green);display:grid;place-items:center;font-size:11px;font-weight:800}
+.hh-inline{margin-top:14px;padding:14px;border:1px solid var(--line);border-radius:12px;background:#fbfbf9}
+.hh-meeting{margin-top:16px}
+button.network-node{font:inherit;text-align:left;cursor:pointer;border-style:dashed}
+.pet-check{border:0;background:none;padding:0;cursor:pointer;font:inherit;text-align:left}
+.level-input{width:100%;accent-color:var(--green);margin:6px 0 2px}
+.person-actions .danger-link{color:var(--orange)}
+.you-tag{margin-left:6px;font-size:10px;font-weight:700;color:var(--green);background:var(--green-2);padding:2px 6px;border-radius:999px;vertical-align:middle}
+.sample-note{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:11px 14px;margin:0 0 16px;border-radius:12px;background:var(--blue-2);color:var(--blue);font-size:13px}
+.sample-note span{flex:1;min-width:200px}
+.save-status{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:20px 25px 25px;padding:10px 12px;border-radius:10px;font-size:13px;background:#f4f5f2;color:var(--muted)}
+.save-status span{flex:1;min-width:180px}
+.save-status.saved{background:var(--green-2);color:var(--green)}
+.save-status.error{background:var(--orange-2);color:var(--orange)}
+.save-status.local{background:var(--blue-2);color:var(--blue)}
+.setup-body{margin:22px 0}
+.setup-body h3{margin:20px 0 4px;font-size:15px}.setup-body h3:first-child{margin-top:0}
+.location-card{display:flex;align-items:flex-start;gap:16px;padding:20px;margin-bottom:16px}.location-card>.settings-icon{flex:none}.location-card>div{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}.location-card small{color:var(--muted);font-size:13px}.location-card .hh-form{margin-bottom:0}
+@media(max-width:760px){.save-status{margin:18px}.hh-form{grid-template-columns:1fr 1fr}.hh-form label:first-child{grid-column:1/-1}}
+.network-builder>.hh-list,.network-builder>.hh-inline,.network-builder>.hh-meeting{margin-left:15px;margin-right:15px}.network-builder>.hh-meeting{margin-bottom:15px}

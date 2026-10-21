@@ -1,6 +1,12 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { supabase, loadProgress, saveProgress } from "./lib/supabase";
+import { CurrentUserContext, FALLBACK_NAME, possessive, useCurrentUser, userFromSession } from "./lib/currentUser";
+import {
+  ALL_RESOURCES, CA_COUNTIES, CONTACT_KINDS, HouseholdContext, MEMBER_TYPES, OWNER_ID, PET_CHECKS, PET_SPECIES, RESOURCE_CATALOG, ROLES, VEHICLE_POWER,
+  analyzeHousehold, countyLabel, demoProfile, emptyProfile, initials, loadHousehold, locationLong, locationShort, memberLabel, newId, newPet, petScore, plural, saveHousehold, useHousehold,
+  type Contact, type ContactKind, type HouseholdProfile, type Member, type MemberType, type Pet, type ResourceStatus, type SaveState, type Vehicle,
+} from "./lib/household";
 import Auth from "./Auth";
 import "./enhancements.css";
 
@@ -84,19 +90,64 @@ function Badge({ children, tone = "green" }: { children: ReactNode; tone?: "gree
   return <span className={`badge badge-${tone}`}>{children}</span>;
 }
 
+const DEFAULT_SCORE = 72;
+
 function App() {
   const [entry, setEntry] = useState<"landing" | "auth" | "setup" | "app">("landing");
   const [authMode, setAuthMode] = useState<"signin" | "signup">("signin");
   const [session, setSession] = useState<Session | null>(null);
   const userId = session?.user.id;
+  const user = useMemo(() => userFromSession(session), [session]);
   const [active, setActive] = useState("Dashboard");
-  const [score, setScore] = useState(72);
+  const [score, setScore] = useState(DEFAULT_SCORE);
   const [scoreOpen, setScoreOpen] = useState(false);
   const [complete, setComplete] = useState<string[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const [notifications, setNotifications] = useState(false);
+  // The score the ring is animating toward, so rapid task completions add up correctly.
+  const scoreTarget = useRef(DEFAULT_SCORE);
+  const scoreTimer = useRef<number | undefined>(undefined);
+  const previousUserId = useRef<string | undefined>(undefined);
 
-  // Keep the session in sync with Supabase (sign in, sign out, page reloads).
+  // Household profile: the guest demo until someone signs in, then that account's own data.
+  const [household, setHousehold] = useState<HouseholdProfile>(demoProfile);
+  const [saveState, setSaveState] = useState<SaveState>("local");
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const householdOwner = useRef<string | undefined>(undefined); // account the loaded profile belongs to; saving is only allowed for it
+  const householdDirty = useRef(false);
+  const pendingSave = useRef<{ userId: string; profile: HouseholdProfile } | null>(null);
+  const updateHousehold = useCallback((change: (p: HouseholdProfile) => HouseholdProfile) => { householdDirty.current = true; setHousehold(change); }, []);
+
+  const flushHousehold = async () => {
+    const pending = pendingSave.current;
+    if (!pending) return;
+    pendingSave.current = null;
+    const error = await saveHousehold(pending.userId, pending.profile);
+    if (householdOwner.current === pending.userId) { setSaveError(error); setSaveState(error ? "error" : "saved"); }
+  };
+
+  // Save household edits shortly after they happen (debounced so typing doesn't spam the database).
+  useEffect(() => {
+    if (!householdDirty.current || !userId || householdOwner.current !== userId) return;
+    pendingSave.current = { userId, profile: household };
+    setSaveState("saving");
+    const timer = window.setTimeout(flushHousehold, 600);
+    return () => window.clearTimeout(timer);
+  }, [household, userId]);
+
+  const showGuestHousehold = () => {
+    householdOwner.current = undefined; householdDirty.current = false; pendingSave.current = null;
+    setHousehold(demoProfile()); setSaveState("local"); setSaveError(null);
+  };
+
+  const resetProgress = (nextScore = DEFAULT_SCORE, nextComplete: string[] = []) => {
+    window.clearInterval(scoreTimer.current);
+    scoreTarget.current = nextScore;
+    setScore(nextScore);
+    setComplete(nextComplete);
+  };
+
+  // Keep the session in sync with Supabase (sign in, sign out, name changes, page reloads).
   useEffect(() => {
     if (!supabase) return;
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -104,35 +155,62 @@ function App() {
     return () => data.subscription.unsubscribe();
   }, []);
 
-  // When a user signs in, load their saved progress. New users go to household setup.
+  // When the account changes, load that account's progress and household.
+  // Accounts without a household profile yet go through household setup.
   useEffect(() => {
+    const signedOut = previousUserId.current && !userId;
+    previousUserId.current = userId;
+    if (signedOut) { resetProgress(); showGuestHousehold(); setActive("Dashboard"); setEntry("landing"); return; }
     if (!userId) return;
-    loadProgress(userId).then((saved) => {
-      if (saved) { setScore(saved.score); setComplete(saved.completed_tasks); setEntry("app"); }
-      else setEntry("setup");
+    // Never show (or save) the previous account's household while this one loads.
+    householdOwner.current = undefined; householdDirty.current = false; pendingSave.current = null;
+    setHousehold(emptyProfile()); setSaveState("idle"); setSaveError(null);
+    let cancelled = false;
+    Promise.all([loadProgress(userId), loadHousehold(userId)]).then(([saved, loaded]) => {
+      if (cancelled) return;
+      setActive("Dashboard");
+      resetProgress(saved?.score, saved?.completed_tasks);
+      householdDirty.current = false;
+      setHousehold(loaded.profile ?? emptyProfile());
+      if (loaded.error) {
+        // Don't risk overwriting a household we couldn't read: keep edits local and say so.
+        setSaveState("error"); setSaveError(`Couldn't load your household (${loaded.error}). Changes won't be saved.`);
+        setEntry(saved ? "app" : "setup");
+        return;
+      }
+      householdOwner.current = userId;
+      setEntry(saved && loaded.profile ? "app" : "setup");
     });
+    return () => { cancelled = true; };
   }, [userId]);
 
   const signOut = async () => {
+    await flushHousehold();
     await supabase?.auth.signOut();
-    setScore(72); setComplete([]); setActive("Dashboard"); setEntry("landing");
+    resetProgress(); showGuestHousehold(); setActive("Dashboard"); setEntry("landing");
   };
 
-  const finishSetup = (household: string[]) => {
-    if (userId) saveProgress(userId, { score, completed_tasks: complete, household });
+  const finishSetup = async () => {
+    if (userId) {
+      saveProgress(userId, { score: scoreTarget.current, completed_tasks: complete });
+      // Save even if nothing was edited, so the account counts as set up next time.
+      if (householdOwner.current === userId) { pendingSave.current = { userId, profile: household }; setSaveState("saving"); flushHousehold(); }
+    }
     setEntry("app");
   };
 
   const completeTask = (title: string, points: number) => {
     if (complete.includes(title)) return;
     setComplete((v) => [...v, title]);
-    let current = score;
-    const target = Math.min(score + points, 100);
+    const target = Math.min(scoreTarget.current + points, 100);
+    scoreTarget.current = target;
     if (userId) saveProgress(userId, { score: target, completed_tasks: [...complete, title] });
-    const timer = window.setInterval(() => {
-      current += 1;
-      setScore(current);
-      if (current >= target) window.clearInterval(timer);
+    window.clearInterval(scoreTimer.current);
+    scoreTimer.current = window.setInterval(() => {
+      setScore((s) => {
+        if (s >= target) { window.clearInterval(scoreTimer.current); return s; }
+        return s + 1;
+      });
     }, 55);
   };
 
@@ -140,11 +218,14 @@ function App() {
 
   const openAuth = (mode: "signin" | "signup") => { setAuthMode(mode); setEntry("auth"); };
 
+  const householdContext = { profile: household, update: updateHousehold, saveState, saveError };
+  const withContext = (content: ReactNode) => <CurrentUserContext.Provider value={user}><HouseholdContext.Provider value={householdContext}>{content}</HouseholdContext.Provider></CurrentUserContext.Provider>;
+
   if (entry === "landing") return <Landing onStart={() => userId ? setEntry("setup") : openAuth("signup")} onSignIn={() => userId ? setEntry("app") : openAuth("signin")} onExplore={() => setEntry("app")}/>;
   if (entry === "auth") return <Auth initialMode={authMode} onBack={() => setEntry("landing")}/>;
-  if (entry === "setup") return <HouseholdSetup onComplete={finishSetup}/>;
+  if (entry === "setup") return withContext(<HouseholdSetup onComplete={finishSetup}/>);
 
-  return <div className="app">
+  return withContext(<div className="app">
     <aside className={`sidebar ${menuOpen ? "open" : ""}`}>
       <div className="brand" onClick={() => go("Dashboard")}><div className="brand-mark"><Icon name="flame" size={20}/></div><div><b>ReadyCA</b><small>WILDFIRE READINESS</small></div></div>
       <nav>{nav.map(([label, icon]) => <button key={label} className={active === label ? "active" : ""} onClick={() => go(label)}><Icon name={icon}/><span>{label}</span>{active === label && <i/>}</button>)}</nav>
@@ -154,13 +235,13 @@ function App() {
     <div className="page">
       <header>
         <button className="mobile-menu" onClick={() => setMenuOpen(!menuOpen)}><Icon name={menuOpen ? "close" : "menu"}/></button>
-        <div className="location"><Icon name="pin"/><div><small>PREPAREDNESS LOCATION</small><b>San Diego County, CA</b></div><Icon name="chevron" size={14}/></div>
+        <button className="location" onClick={() => go("Settings")} aria-label="Change preparedness location"><Icon name="pin"/><div><small>PREPAREDNESS LOCATION</small><b>{locationShort(household)}</b></div><Icon name="chevron" size={14}/></button>
         <div className="header-actions">
           <Badge tone="orange"><span className="status-dot"/> MODERATE RISK</Badge>
           <button className="icon-button" aria-label="Help"><Icon name="help"/></button>
           <button className="icon-button notify" aria-label="Notifications" onClick={() => setNotifications(!notifications)}><Icon name="bell"/><i/></button>
-          {session
-            ? <><div className="avatar" title={session.user.email}>{(session.user.email ?? "?").slice(0, 2).toUpperCase()}</div><button className="text-button" onClick={signOut}>Sign out</button></>
+          {user.signedIn
+            ? <><button className="avatar" title={`${user.name}${user.email ? ` · ${user.email}` : ""}`} aria-label={`Account settings for ${user.name}`} onClick={() => go("Settings")}>{user.initials}</button><button className="text-button" onClick={signOut}>Sign out</button></>
             : <button className="text-button" onClick={() => openAuth("signin")}>Sign in</button>}
         </div>
         {notifications && <NotificationPanel onClose={() => setNotifications(false)}/>}
@@ -168,22 +249,22 @@ function App() {
 
       <main>
         {active === "Dashboard" && <Dashboard score={score} complete={complete} openScore={() => setScoreOpen(true)} completeTask={completeTask} go={go}/>}
-        {active === "My Household" && <Household/>}
+        {active === "My Household" && <Household onSignIn={() => openAuth("signin")}/>}
         {active === "Wildfire Risk" && <RiskMap go={go}/>}
-        {active === "Evacuation" && <Evacuation/>}
+        {active === "Evacuation" && <Evacuation go={go}/>}
         {active === "AI Readiness Advisor" && <Advisor/>}
         {active === "Emergency Decision Game" && <DecisionGame/>}
         {active === "Progress" && <Progress score={score} complete={complete}/>}
         {active === "Sources & Evidence" && <Evidence/>}
         {active === "Preparedness Report" && <Report score={score}/>}
         {active === "Preparedness Plan" && <PreparednessPlan complete={complete} completeTask={completeTask}/>}
-        {active === "Settings" && <Settings/>}
+        {active === "Settings" && <Settings onSignIn={() => openAuth("signin")} go={go}/>}
       </main>
     </div>
     {scoreOpen && <ScoreModal score={score} complete={complete} close={() => setScoreOpen(false)} completeTask={completeTask}/>}
     {menuOpen && <div className="scrim mobile-only" onClick={() => setMenuOpen(false)}/>}
     <div className="bottom-nav">{[["Dashboard","grid"],["Wildfire Risk","flame"],["Evacuation","route"],["Progress","chart"]] .map(([label,icon])=><button className={active===label?"active":""} onClick={()=>go(label)} key={label}><Icon name={icon as IconName}/><span>{label==="Wildfire Risk"?"Risk":label}</span></button>)}<button onClick={()=>setMenuOpen(true)}><Icon name="menu"/><span>More</span></button></div>
-  </div>;
+  </div>);
 }
 
 function Landing({onStart,onSignIn,onExplore}:{onStart:()=>void;onSignIn:()=>void;onExplore:()=>void}) {
@@ -195,24 +276,72 @@ function Landing({onStart,onSignIn,onExplore}:{onStart:()=>void;onSignIn:()=>voi
   </div>;
 }
 
-function HouseholdSetup({onComplete}:{onComplete:(household:string[])=>void}) {
+function HouseholdSetup({onComplete}:{onComplete:()=>void}) {
+  const user = useCurrentUser();
+  const { profile, update } = useHousehold();
   const [step,setStep]=useState(0);
-  const steps=[["Your household","Tell us who you are preparing for.",["2 adults","1 child","1 older adult","Accessibility needs"]],["Pets & transportation","Plan for everyone and every way out.",["1 dog","Pet carrier ready","2 vehicles","Fuel above half"]],["Communication","Make sure your household can reconnect.",["Primary phone added","Emergency contact","Out-of-area contact","Text alerts preferred"]]] as const;
-  const [selected,setSelected]=useState<string[]>(["2 adults","1 child","1 dog","2 vehicles"]);
-  const current=steps[step];
-  return <div className="setup-page"><header><div className="brand"><div className="brand-mark"><Icon name="flame"/></div><div><b>ReadyCA</b><small>HOUSEHOLD SETUP</small></div></div><button className="text-button" onClick={()=>onComplete(selected)}>Save & finish later</button></header><main><div className="setup-progress"><span>STEP {step+1} OF {steps.length}</span><div>{steps.map((_,i)=><i className={i<=step?"active":""} key={i}/>)}</div></div><Badge tone="blue">USER-PROVIDED INFORMATION</Badge><h1>{current[0]}</h1><p>{current[1]} You can update these details at any time.</p><div className="setup-options">{current[2].map((x,i)=><button className={selected.includes(x)?"selected":""} onClick={()=>setSelected(v=>v.includes(x)?v.filter(y=>y!==x):[...v,x])} key={x}><span><Icon name={(["users","users","pet","car"] as IconName[])[i]}/></span><b>{x}</b><i>{selected.includes(x)&&<Icon name="check"/>}</i></button>)}</div><div className="setup-insight"><Icon name="spark"/><div><b>Why we ask</b><span>These details shape your evacuation timing, supply list, transportation plan, and priority recommendations. ReadyCA does not infer sensitive characteristics.</span></div></div><div className="setup-actions"><Button variant="secondary" onClick={()=>setStep(Math.max(0,step-1))} disabled={step===0}>Back</Button><Button onClick={()=>step<steps.length-1?setStep(step+1):onComplete(selected)}>{step===steps.length-1?"View my readiness dashboard":"Continue"} <Icon name="arrow"/></Button></div></main></div>;
+  const steps:[string,string,string][]=[
+    ["Where do you live?","Your county shapes local risk, alerts, and evacuation guidance.","Location is used to personalize risk and evacuation guidance. ReadyCA never shares it."],
+    ["Who's in your household?","Add everyone you're preparing for, including anyone who needs extra help.","Support needs shape evacuation timing and supply recommendations. ReadyCA does not infer sensitive characteristics."],
+    ["Pets & transportation","Plan for every animal and every way out.","Vehicles and pets determine seating capacity and what to pack."],
+    ["Stay connected","Make sure your household can reconnect if you're separated.","An out-of-area contact and a meeting point are two of the most important parts of a plan."],
+  ];
+  const [title,copy,why]=steps[step];
+  const removeFrom=<K extends "members"|"pets"|"vehicles"|"contacts">(key:K,id:string)=>update(p=>({...p,[key]:(p[key] as {id:string}[]).filter(x=>x.id!==id)}));
+  const listItem=(id:string,label:string,sub:string,key:"members"|"pets"|"vehicles"|"contacts")=><li key={id}><span className="hh-list-initials">{initials(label)}</span><div><b>{label}</b><small>{sub}</small></div><RemoveButton label={`Remove ${label}`} onClick={()=>removeFrom(key,id)}/></li>;
+  const [meetingPoint,setMeetingPoint]=useState(profile.meetingPoint);
+  const next=()=>{
+    if(step===3)update(p=>({...p,meetingPoint:tidy(meetingPoint)}));
+    if(step<steps.length-1)setStep(step+1); else onComplete();
+  };
+  return <div className="setup-page"><header><div className="brand"><div className="brand-mark"><Icon name="flame"/></div><div><b>ReadyCA</b><small>HOUSEHOLD SETUP</small></div></div><button className="text-button" onClick={()=>{if(step===3)update(p=>({...p,meetingPoint:tidy(meetingPoint)}));onComplete()}}>Save & finish later</button></header><main><div className="setup-progress"><span>STEP {step+1} OF {steps.length}</span><div>{steps.map((_,i)=><i className={i<=step?"active":""} key={i}/>)}</div></div><Badge tone="blue">USER-PROVIDED INFORMATION</Badge><h1>{title}</h1><p>{copy} You can update these details at any time.</p>
+    <div className="setup-body">
+      {step===0&&<LocationForm autoSave/>}
+      {step===1&&<>
+        <h3>You</h3>
+        <form className="hh-form" onSubmit={e=>e.preventDefault()}><label>Name<input value={user.name} disabled title="Change your name in Settings"/></label><label>Type<select value={profile.owner.type} onChange={e=>{const type=e.target.value as MemberType;update(p=>({...p,owner:{...p.owner,type}}))}}>{MEMBER_TYPES.map(t=><option key={t}>{t}</option>)}</select></label><label className="hh-wide">Your support needs<input value={profile.owner.supportNeeds} maxLength={120} placeholder="Optional" onChange={e=>{const supportNeeds=e.target.value;update(p=>({...p,owner:{...p.owner,supportNeeds}}))}}/></label></form>
+        <h3>Others in your household</h3>
+        {profile.members.length>0&&<ul className="hh-list">{profile.members.map(m=>listItem(m.id,m.name,`${memberLabel(m)}${m.supportNeeds?` · ${m.supportNeeds}`:""}`,"members"))}</ul>}
+        <MemberForm submitLabel="Add person" onSave={m=>update(p=>({...p,members:[...p.members,m]}))}/>
+      </>}
+      {step===2&&<>
+        <h3>Pets</h3>
+        {profile.pets.length>0&&<ul className="hh-list">{profile.pets.map(pet=>listItem(pet.id,pet.name,`${pet.species}${pet.age!=null?` · ${plural(pet.age,"year")}`:""}`,"pets"))}</ul>}
+        <PetForm submitLabel="Add pet" onSave={pet=>update(p=>({...p,pets:[...p.pets,pet]}))}/>
+        <h3>Vehicles</h3>
+        {profile.vehicles.length>0&&<ul className="hh-list">{profile.vehicles.map((v,i)=>listItem(v.id,v.name,`${i===0?"Primary":"Backup"} · ${plural(v.seats,"seat")} · ${v.power}`,"vehicles"))}</ul>}
+        <VehicleForm submitLabel="Add vehicle" onSave={v=>update(p=>({...p,vehicles:[...p.vehicles,v]}))}/>
+      </>}
+      {step===3&&<>
+        <h3>Emergency contacts</h3>
+        {profile.contacts.length>0&&<ul className="hh-list">{profile.contacts.map(c=>listItem(c.id,c.name,`${c.kind}${c.detail?` · ${c.detail}`:""}`,"contacts"))}</ul>}
+        <ContactForm submitLabel="Add contact" kind={profile.contacts.some(c=>c.kind==="Out-of-area contact")?"Emergency contact":"Out-of-area contact"} key={profile.contacts.length} onSave={c=>update(p=>({...p,contacts:[...p.contacts,c]}))}/>
+        <h3>Meeting point</h3>
+        <form className="hh-form" onSubmit={e=>e.preventDefault()}><label className="hh-wide">Where will everyone meet if separated?<input value={meetingPoint} maxLength={80} placeholder="e.g. Library parking lot on Main St" onChange={e=>setMeetingPoint(e.target.value)}/></label></form>
+      </>}
+    </div>
+    <div className="setup-insight"><Icon name="spark"/><div><b>Why we ask</b><span>{why}</span></div></div><div className="setup-actions"><Button variant="secondary" onClick={()=>setStep(Math.max(0,step-1))} disabled={step===0}>Back</Button><Button onClick={next}>{step===steps.length-1?"View my readiness dashboard":step===0&&!profile.location.county?"Skip for now":"Continue"} <Icon name="arrow"/></Button></div></main></div>;
+}
+
+function greetingFor(date: Date) {
+  const hour = date.getHours();
+  return hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
 }
 
 function Dashboard({ score, complete, openScore, completeTask, go }: { score: number; complete: string[]; openScore: () => void; completeTask: (t: string, p: number) => void; go: (n: string) => void }) {
+  const user = useCurrentUser();
+  const household = useHousehold().profile;
+  const now = new Date();
+  const today = now.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" }).toUpperCase();
   return <div className="dashboard">
-    <section className="welcome"><div><div className="eyebrow">MONDAY, SEPTEMBER 23</div><h1>Good evening, Brinda.</h1><p>Here's your household's wildfire readiness at a glance.</p></div><Button variant="secondary" icon="pin">San Diego County</Button></section>
+    <section className="welcome"><div><div className="eyebrow">{today}</div><h1>{greetingFor(now)}, {user.firstName}.</h1><p>Here's your household's wildfire readiness at a glance.</p></div><Button variant="secondary" icon="pin" onClick={() => go("Settings")}>{countyLabel(household) || "Set your location"}</Button></section>
     <section className="risk-banner"><div className="risk-icon"><Icon name="flame"/></div><div><Badge tone="orange">LOCAL RISK · MODERATE</Badge><b>No active evacuation order near your selected location</b><span>Conditions can change quickly. Last checked 8 minutes ago.</span></div><Button variant="secondary" onClick={() => go("Wildfire Risk")}>View local risk <Icon name="arrow"/></Button></section>
 
     <div className="dashboard-grid">
       <section className="card readiness-card">
         <div className="card-heading"><div><span className="kicker">PERSONAL READINESS</span><h2>Your household readiness</h2></div><Badge>GOOD PREPAREDNESS</Badge></div>
         <div className="readiness-main"><ScoreRing score={score}/><div className="readiness-copy"><div className="score-large">{score}<span>/ 100</span></div><p>{score > 72 ? "Nice work — your readiness plan is getting stronger." : "Good start — but there are a few important gaps to address."}</p><Button variant="secondary" onClick={openScore}>Why is my score {score}%? <Icon name="arrow"/></Button></div></div>
-        <div className="readiness-footer"><span><Icon name="chart" size={16}/> <b>+8 points</b> in the last 30 days</span><span>Profile strength <b>78%</b></span></div>
+        <div className="readiness-footer"><span><Icon name="chart" size={16}/> <b>+8 points</b> in the last 30 days</span><span>Profile strength <b>{analyzeHousehold(household).completeness}%</b></span></div>
       </section>
 
       <section className="card priority-card">
@@ -236,7 +365,7 @@ function Dashboard({ score, complete, openScore, completeTask, go }: { score: nu
         <Button variant="secondary" onClick={() => go("Wildfire Risk")}>Open interactive risk map</Button>
       </section>
       <section className="card progress-card">
-        <div className="card-heading"><div><span className="kicker">SEPTEMBER GOAL</span><h2>Build your evacuation plan</h2></div><b>3 / 5</b></div>
+        <div className="card-heading"><div><span className="kicker">{now.toLocaleDateString("en-US", { month: "long" }).toUpperCase()} GOAL</span><h2>Build your evacuation plan</h2></div><b>3 / 5</b></div>
         <div className="progress"><i style={{width:"60%"}}/></div>
         {["Choose two exit routes", "Identify a meeting point", "Save a nearby shelter", "Practice the primary route", "Share plan with family"].map((x,i)=><div className={`task-row ${i < 3 ? "done" : ""}`} key={x}><span>{i < 3 && <Icon name="check" size={14}/>}</span><div><b>{x}</b><small>{i < 3 ? "Completed" : i === 3 ? "Recommended next" : "Not started"}</small></div></div>)}
         <Button variant="ghost" onClick={() => go("Progress")}>See all progress <Icon name="arrow"/></Button>
@@ -274,219 +403,371 @@ function ScoreModal({ score, complete, close, completeTask }: { score: number; c
   </div></div>;
 }
 
+// Incident, route, and shelter details on these pages are San Diego County examples
+// until a live data source is connected; say so when the household lives elsewhere.
+function SampleDataNote({ go }: { go:(n:string)=>void }) {
+  const { profile } = useHousehold();
+  if (profile.location.county === "San Diego") return null;
+  return <div className="sample-note"><Icon name="help"/><span>{profile.location.county?`Live incident and route data for ${countyLabel(profile)} isn't connected yet. The map, incidents, and shelters below are San Diego County examples.`:"Set your location to personalize this page. The map, incidents, and shelters below are San Diego County examples."}</span><button className="text-button" onClick={()=>go("Settings")}>{profile.location.county?"Change location":"Set location"}</button></div>;
+}
+
 function RiskMap({ go }: { go:(n:string)=>void }) {
   const [layer,setLayer]=useState("Risk");
   return <div><PageTitle kicker="LIVE SITUATIONAL AWARENESS" title="Wildfire Risk" copy="Monitor local incidents, evacuation zones, shelters, and road conditions."/>
+    <SampleDataNote go={go}/>
     <div className="map-layout"><section className="card map-panel"><div className="map-controls">{["Risk","Active Fires","Evacuation Zones","Shelters","Roads"].map(x=><button className={layer===x?"active":""} onClick={()=>setLayer(x)} key={x}>{x}</button>)}</div><MiniMap interactive/><div className="map-disclaimer"><Icon name="shield"/> Emergency information can change rapidly. Always follow official evacuation orders and instructions from local authorities.</div></section>
     <aside className="card risk-side"><span className="kicker">CURRENT LOCAL RISK</span><div className="risk-level"><span>MODERATE</span><i>3</i></div><p>No active evacuation order detected near your selected location.</p><hr/><Info label="Nearest active wildfire" value="Border 2 Fire"/><Info label="Distance" value="42 miles southeast"/><Info label="Fire status" value="18% contained"/><Info label="Last updated" value="8 minutes ago"/><Info label="Evacuation zone" value="No current order"/><Info label="Nearby shelter" value="Canyon Hills · Open"/><Button onClick={()=>go("Evacuation")}>Plan evacuation route <Icon name="arrow"/></Button><div className="verified"><Icon name="shield"/> Verified incident sources</div></aside></div>
   </div>;
 }
 
-function Evacuation() {
+function Evacuation({ go }: { go:(n:string)=>void }) {
+  const { profile, update } = useHousehold();
   const [route,setRoute]=useState("Primary");
-  const [saved,setSaved]=useState(false);
+  const saved=profile.evacuationPlanSaved;
   return <div><PageTitle kicker="HOUSEHOLD PLAN" title="Your Evacuation Plan" copy="Review two ways out and keep a destination ready before conditions change."/>
+    <SampleDataNote go={go}/>
     <div className="route-tabs"><button className={route==="Primary"?"active":""} onClick={()=>setRoute("Primary")}>Primary Evacuation Route</button><button className={route==="Backup"?"active":""} onClick={()=>setRoute("Backup")}>Backup Evacuation Route</button></div>
     <div className="map-layout"><section className="card route-map"><MiniMap interactive/><div className={`route-overlay ${route==="Backup"?"backup":""}`}><i/><i/><i/><i/></div></section>
-    <aside className="card risk-side"><Badge tone={route==="Primary"?"green":"blue"}>{route.toUpperCase()} ROUTE</Badge><h2>Home → {route==="Primary"?"Canyon Hills Shelter":"Poway Community Center"}</h2><div className="route-metrics"><div><b>{route==="Primary"?"24":"31"} min</b><span>Estimated time</span></div><div><b>{route==="Primary"?"13.2":"18.7"} mi</b><span>Distance</span></div></div><Info label="Major roads" value={route==="Primary"?"I-15 N → CA-56":"Scripps Poway Pkwy"}/><Info label="Potential hazards" value={route==="Primary"?"1 narrow segment":"Heavy school traffic"}/><Info label="Road closures" value="None reported"/><div className="button-stack"><Button onClick={()=>setSaved(true)}>{saved?<><Icon name="check"/> Plan saved</>:"Save Evacuation Plan"}</Button><Button variant="secondary">Practice This Route</Button></div></aside></div>
+    <aside className="card risk-side"><Badge tone={route==="Primary"?"green":"blue"}>{route.toUpperCase()} ROUTE</Badge><h2>Home → {route==="Primary"?"Canyon Hills Shelter":"Poway Community Center"}</h2><div className="route-metrics"><div><b>{route==="Primary"?"24":"31"} min</b><span>Estimated time</span></div><div><b>{route==="Primary"?"13.2":"18.7"} mi</b><span>Distance</span></div></div><Info label="Major roads" value={route==="Primary"?"I-15 N → CA-56":"Scripps Poway Pkwy"}/><Info label="Potential hazards" value={route==="Primary"?"1 narrow segment":"Heavy school traffic"}/><Info label="Household meeting point" value={profile.meetingPoint||"Not set"}/><Info label="Evacuating" value={`${plural(1+profile.members.length,"person")} · ${plural(profile.pets.length,"pet")}`}/><div className="button-stack"><Button onClick={()=>update(p=>({...p,evacuationPlanSaved:!p.evacuationPlanSaved}))}>{saved?<><Icon name="check"/> Plan saved</>:"Save Evacuation Plan"}</Button><Button variant="secondary">Practice This Route</Button></div></aside></div>
     <section className="section-head"><div><span className="kicker">SAFE DESTINATIONS</span><h2>Nearby emergency shelters</h2></div></section>
     <div className="shelters">{["Canyon Hills Recreation Center","Poway Community Center","Mira Mesa Senior Center"].map((x,i)=><div className="card shelter" key={x}><div className="shelter-icon"><Icon name="home"/></div><div><h3>{x}</h3><p>{[4.8,7.2,9.1][i]} miles · <span className="safe-text">Open</span></p><span className="amenity">Pet-friendly</span><span className="amenity">Accessible</span></div><Icon name="chevron"/></div>)}</div>
   </div>;
 }
 
-type ResourceStatus = "ready" | "attention" | "missing";
-type ResourceItem = {
-  name: string;
-  status: ResourceStatus;
-  quantity: string;
-  detail: string;
-  meta: string;
-  impact?: number;
-  why?: string;
-};
+// ---- household forms (used by the Household pages and by first-time setup) ----
 
-const resourceCategories: { name: string; icon: IconName; items: ResourceItem[] }[] = [
-  {
-    name: "Safety Equipment",
-    icon: "shield",
-    items: [
-      { name: "Fire extinguisher", status: "ready", quantity: "1", detail: "Garage cabinet", meta: "Inspected 18 days ago" },
-      { name: "Smoke alarms", status: "ready", quantity: "4", detail: "Throughout home", meta: "Tested September 12" },
-      { name: "Carbon monoxide detector", status: "ready", quantity: "2", detail: "Hallways", meta: "Batteries replaced August 3" },
-      { name: "N95 masks", status: "missing", quantity: "0", detail: "Not in inventory", meta: "Add one per household member", impact: 2, why: "Helps reduce smoke-particle exposure during evacuation." },
-    ],
-  },
-  {
-    name: "Emergency Supplies",
-    icon: "box",
-    items: [
-      { name: "72-hour emergency kit", status: "ready", quantity: "1", detail: "Garage emergency shelf", meta: "Updated 18 days ago" },
-      { name: "Water storage", status: "attention", quantity: "6 gal", detail: "Garage emergency shelf", meta: "Needs 3 more gallons · expires in 7 months", impact: 2, why: "Your current supply is below the three-day target for four people." },
-      { name: "Food supply", status: "ready", quantity: "12 meals", detail: "Kitchen pantry", meta: "Expires April 2026" },
-      { name: "First aid kit", status: "ready", quantity: "1", detail: "Hall closet", meta: "Inspected September 12" },
-    ],
-  },
-  {
-    name: "Power & Lighting",
-    icon: "spark",
-    items: [
-      { name: "Flashlights", status: "ready", quantity: "3", detail: "Emergency shelf", meta: "Batteries tested this month" },
-      { name: "Spare batteries", status: "ready", quantity: "16", detail: "Emergency shelf", meta: "Updated 18 days ago" },
-      { name: "Solar charger", status: "ready", quantity: "1", detail: "Go-bag", meta: "Charge tested September 1" },
-      { name: "Power banks", status: "ready", quantity: "2", detail: "Go-bag", meta: "Both fully charged" },
-    ],
-  },
-  {
-    name: "Communication Tools",
-    icon: "phone",
-    items: [
-      { name: "Battery radio", status: "missing", quantity: "0", detail: "Not in inventory", meta: "Recommended for power outages", impact: 2, why: "A battery radio provides official updates if mobile service fails." },
-      { name: "Emergency contacts", status: "ready", quantity: "5", detail: "Phones + printed card", meta: "Reviewed September 12" },
-      { name: "Printed plans", status: "ready", quantity: "2", detail: "Go-bag and vehicle", meta: "Routes updated this month" },
-      { name: "Backup phone charging", status: "ready", quantity: "2", detail: "Go-bag", meta: "Cables and car adapter ready" },
-    ],
-  },
-  {
-    name: "Important Documents",
-    icon: "file",
-    items: [
-      { name: "Identification copies", status: "ready", quantity: "4", detail: "Waterproof document pouch", meta: "Updated June 2024" },
-      { name: "Insurance documents", status: "ready", quantity: "1 set", detail: "Document pouch + cloud", meta: "Policy current" },
-      { name: "Medical information", status: "missing", quantity: "0", detail: "Not in document pouch", meta: "Add medications and provider details", impact: 1, why: "A printed medical summary supports continuity of care during displacement." },
-      { name: "Property documents", status: "ready", quantity: "1 set", detail: "Encrypted cloud folder", meta: "Updated August 2024" },
-    ],
-  },
-];
+const parseAge=(value:string)=>{const n=Number.parseInt(value,10);return Number.isFinite(n)&&n>=0&&n<=120?n:null};
+const tidy=(value:string)=>value.trim().replace(/\s+/g," ");
+
+function FormActions({onCancel,submitLabel}:{onCancel?:()=>void;submitLabel:string}) {
+  return <div className="hh-form-actions">{onCancel&&<button type="button" className="btn btn-secondary" onClick={onCancel}><span>Cancel</span></button>}<button type="submit" className="btn btn-primary"><span>{submitLabel}</span></button></div>;
+}
+
+function MemberForm({initial,isOwner=false,onSave,onCancel,submitLabel="Save"}:{initial?:Member;isOwner?:boolean;onSave:(m:Member)=>void;onCancel?:()=>void;submitLabel?:string}) {
+  const [name,setName]=useState(initial?.name??"");
+  const [type,setType]=useState<MemberType>(initial?.type??"Adult");
+  const [age,setAge]=useState(initial?.age!=null?String(initial.age):"");
+  const [needs,setNeeds]=useState(initial?.supportNeeds??"");
+  const submit=()=>{
+    if(!isOwner&&!tidy(name))return;
+    onSave({id:initial?.id??newId(),name:tidy(name),type,age:parseAge(age),supportNeeds:tidy(needs),planReady:initial?.planReady??false});
+    if(!initial){setName("");setType("Adult");setAge("");setNeeds("")}
+  };
+  return <form className="hh-form" onSubmit={e=>{e.preventDefault();submit()}}>
+    <label>Name{isOwner?<input value={initial?.name??""} disabled title="Change your name in Settings"/>:<input value={name} required maxLength={40} placeholder="e.g. Alex" onChange={e=>setName(e.target.value)}/>}</label>
+    <label>Type<select value={type} onChange={e=>setType(e.target.value as MemberType)}>{MEMBER_TYPES.map(t=><option key={t}>{t}</option>)}</select></label>
+    <label>Age<input value={age} inputMode="numeric" maxLength={3} placeholder="Optional" onChange={e=>setAge(e.target.value.replace(/\D/g,""))}/></label>
+    <label className="hh-wide">Support needs<input value={needs} maxLength={120} placeholder="e.g. Uses a wheelchair, needs daily medication" onChange={e=>setNeeds(e.target.value)}/></label>
+    <FormActions onCancel={onCancel} submitLabel={submitLabel}/>
+  </form>;
+}
+
+function PetForm({initial,onSave,onCancel,submitLabel="Save"}:{initial?:Pet;onSave:(p:Pet)=>void;onCancel?:()=>void;submitLabel?:string}) {
+  const [name,setName]=useState(initial?.name??"");
+  const [species,setSpecies]=useState<Pet["species"]>(initial?.species??"Dog");
+  const [age,setAge]=useState(initial?.age!=null?String(initial.age):"");
+  const submit=()=>{
+    if(!tidy(name))return;
+    onSave(initial?{...initial,name:tidy(name),species,age:parseAge(age)}:newPet(tidy(name),species,parseAge(age)));
+    if(!initial){setName("");setSpecies("Dog");setAge("")}
+  };
+  return <form className="hh-form" onSubmit={e=>{e.preventDefault();submit()}}>
+    <label>Pet name<input value={name} required maxLength={40} placeholder="e.g. Luna" onChange={e=>setName(e.target.value)}/></label>
+    <label>Species<select value={species} onChange={e=>setSpecies(e.target.value as Pet["species"])}>{PET_SPECIES.map(s=><option key={s}>{s}</option>)}</select></label>
+    <label>Age<input value={age} inputMode="numeric" maxLength={2} placeholder="Optional" onChange={e=>setAge(e.target.value.replace(/\D/g,""))}/></label>
+    <FormActions onCancel={onCancel} submitLabel={submitLabel}/>
+  </form>;
+}
+
+function VehicleForm({initial,onSave,onCancel,submitLabel="Save"}:{initial?:Vehicle;onSave:(v:Vehicle)=>void;onCancel?:()=>void;submitLabel?:string}) {
+  const [name,setName]=useState(initial?.name??"");
+  const [seats,setSeats]=useState(String(initial?.seats??5));
+  const [power,setPower]=useState<Vehicle["power"]>(initial?.power??"Fuel");
+  const submit=()=>{
+    if(!tidy(name))return;
+    onSave({id:initial?.id??newId(),name:tidy(name),seats:Math.min(Math.max(Number(seats)||1,1),15),power,level:initial?.level??100});
+    if(!initial){setName("");setSeats("5");setPower("Fuel")}
+  };
+  return <form className="hh-form" onSubmit={e=>{e.preventDefault();submit()}}>
+    <label>Vehicle<input value={name} required maxLength={40} placeholder="e.g. Toyota Sienna" onChange={e=>setName(e.target.value)}/></label>
+    <label>Seats<select value={seats} onChange={e=>setSeats(e.target.value)}>{[2,4,5,6,7,8,9,12,15].map(n=><option key={n}>{n}</option>)}</select></label>
+    <label>Power<select value={power} onChange={e=>setPower(e.target.value as Vehicle["power"])}>{VEHICLE_POWER.map(p=><option key={p}>{p}</option>)}</select></label>
+    <FormActions onCancel={onCancel} submitLabel={submitLabel}/>
+  </form>;
+}
+
+function ContactForm({initial,kind,onSave,onCancel,submitLabel="Save"}:{initial?:Contact;kind?:ContactKind;onSave:(c:Contact)=>void;onCancel?:()=>void;submitLabel?:string}) {
+  const [name,setName]=useState(initial?.name??"");
+  const [contactKind,setContactKind]=useState<ContactKind>(initial?.kind??kind??"Emergency contact");
+  const [detail,setDetail]=useState(initial?.detail??"");
+  const submit=()=>{
+    if(!tidy(name))return;
+    onSave({id:initial?.id??newId(),name:tidy(name),kind:contactKind,detail:tidy(detail)});
+    if(!initial){setName("");setDetail("")}
+  };
+  return <form className="hh-form" onSubmit={e=>{e.preventDefault();submit()}}>
+    <label>Name<input value={name} required maxLength={60} placeholder="e.g. Aunt Lisa" onChange={e=>setName(e.target.value)}/></label>
+    <label>Type<select value={contactKind} onChange={e=>setContactKind(e.target.value as ContactKind)}>{CONTACT_KINDS.map(k=><option key={k}>{k}</option>)}</select></label>
+    <label>Phone or location<input value={detail} maxLength={60} placeholder="Optional, e.g. (555) 010-2030 · Arizona" onChange={e=>setDetail(e.target.value)}/></label>
+    <FormActions onCancel={onCancel} submitLabel={submitLabel}/>
+  </form>;
+}
+
+// autoSave: write every change straight to the profile (setup wizard); otherwise save on submit (Settings).
+function LocationForm({autoSave=false,onSaved,submitLabel="Save location"}:{autoSave?:boolean;onSaved?:()=>void;submitLabel?:string}) {
+  const { profile, update } = useHousehold();
+  const [county,setCounty]=useState(profile.location.county);
+  const [city,setCity]=useState(profile.location.city);
+  useEffect(()=>{setCounty(profile.location.county);setCity(profile.location.city)},[profile.location.county,profile.location.city]);
+  const save=(next:{county:string;city:string})=>update(p=>({...p,location:{county:next.county,city:tidy(next.city)}}));
+  const dirty=county!==profile.location.county||tidy(city)!==profile.location.city;
+  return <form className="hh-form" onSubmit={e=>{e.preventDefault();save({county,city});onSaved?.()}}>
+    <label>County<select value={county} required onChange={e=>{setCounty(e.target.value);if(autoSave)save({county:e.target.value,city})}}><option value="">Choose your county</option>{CA_COUNTIES.map(c=><option key={c} value={c}>{c} County</option>)}</select></label>
+    <label>City or community<input value={city} maxLength={60} placeholder="Optional, e.g. Paradise" onChange={e=>{setCity(e.target.value);if(autoSave)save({county,city:e.target.value})}}/></label>
+    {!autoSave&&<FormActions submitLabel={dirty||!profile.location.county?submitLabel:"Saved"}/>}
+  </form>;
+}
+
+function RemoveButton({label,onClick}:{label:string;onClick:()=>void}) {
+  return <button type="button" className="hh-remove" aria-label={label} title={label} onClick={onClick}><Icon name="close" size={14}/></button>;
+}
+
+function EmptyState({icon,title,copy}:{icon:IconName;title:string;copy:string}) {
+  return <div className="hh-empty"><Icon name={icon} size={22}/><div><b>{title}</b><span>{copy}</span></div></div>;
+}
+
+// ---- household pages --------------------------------------------------------
 
 function HouseholdOverview() {
+  const { profile } = useHousehold();
+  const a = analyzeHousehold(profile);
   const [simulation,setSimulation]=useState(false);
-  const readiness=[["People",86,"users"],["Pets",72,"pet"],["Transportation",91,"car"],["Communication",68,"phone"],["Resources",84,"box"]] as [string,number,IconName][];
+  const readiness=[["People",a.people,"users"],["Pets",a.pets,"pet"],["Transportation",a.transportation,"car"],["Communication",a.communication,"phone"],["Resources",a.resources,"box"]] as [string,number,IconName][];
+  const ranked=[...readiness,["Evacuation",a.evacuation,"route"] as [string,number,IconName]].sort((x,y)=>y[1]-x[1]);
+  const [strongest,weakest]=[ranked[0],ranked[ranked.length-1]];
+  // Radar vertices (outer ring) in label order: people, pets, transport, resources, communication, evacuation.
+  const axes:[number,number,number][]=[[110,18,a.people],[190,60,a.pets],[190,138,a.transportation],[110,178,a.resources],[30,138,a.communication],[30,60,a.evacuation]];
+  const radar=axes.map(([x,y,v])=>{const r=Math.max(v,4)/100;return `${Math.round(110+(x-110)*r)},${Math.round(98+(y-98)*r)}`}).join(" ");
+  const success=Math.round(ranked.reduce((s,[,v])=>s+v,0)/ranked.length);
+  const tone=(v:number)=>v>=80?"green":"orange";
+  const checks:[string,string,string][]=[
+    ["People readiness",a.people===100?"Ready":`${a.people}%`,tone(a.people)],
+    ...(profile.pets.length?[["Pet readiness",a.pets===100?"Ready":`${a.pets}%`,tone(a.pets)] as [string,string,string]]:[]),
+    ["Communication reliability",a.communication===100?"Ready":"Needs backup",tone(a.communication)],
+    ["Vehicle availability",profile.vehicles.length===0?"No vehicle":a.seats>=a.seatsNeeded?"Ready":"Capacity risk",profile.vehicles.length&&a.seats>=a.seatsNeeded?"green":"orange"],
+    ["Resource coverage",`${a.resources}%`,tone(a.resources)],
+  ];
   return <div className="household-overview">
     <div className="household-scoreboard">{readiness.map(([label,value,icon])=><article key={label}><span><Icon name={icon}/></span><div><small>{label.toUpperCase()}</small><b>{value}%</b></div><div className="progress"><i style={{width:`${value}%`}}/></div></article>)}</div>
     <div className="twin-grid">
-      <section className="twin-radar"><div><span className="kicker">DYNAMIC HOUSEHOLD MODEL</span><h3>Readiness balance</h3><p>Your strongest systems support evacuation, while communication and pet planning create the most exposure.</p></div><div className="household-radar"><svg viewBox="0 0 220 190"><g className="radar-grid"><polygon points="110,18 190,60 190,138 110,178 30,138 30,60"/><polygon points="110,46 163,74 163,124 110,150 57,124 57,74"/><line x1="110" y1="18" x2="110" y2="98"/><line x1="190" y1="60" x2="110" y2="98"/><line x1="190" y1="138" x2="110" y2="98"/><line x1="110" y1="178" x2="110" y2="98"/><line x1="30" y1="138" x2="110" y2="98"/><line x1="30" y1="60" x2="110" y2="98"/></g><polygon className="radar-value" points="110,29 183,63 168,127 110,153 52,127 42,66"/></svg><span className="radar-l r-people">People</span><span className="radar-l r-pets">Pets</span><span className="radar-l r-transport">Transport</span><span className="radar-l r-resources">Supplies</span><span className="radar-l r-communication">Communication</span><span className="radar-l r-evacuation">Evacuation</span></div></section>
-      <aside className="command-insights"><span className="kicker">AI READINESS INSIGHTS</span><h3>Three ways to strengthen your household</h3>{[
-        ["Communication is your biggest vulnerability","Add an out-of-area contact to create a reliable fallback.","+4 pts"],
-        ["Pet transportation needs a backup","Confirm a second carrier for Luna and Milo.","+3 pts"],
-        ["Transportation readiness is strong","Both routes are compatible with your primary vehicle.","91%"],
-      ].map(([title,copy,impact],i)=><article key={title}><span className={`insight-rank rank-${i}`}>{i+1}</span><div><b>{title}</b><p>{copy}</p></div><strong>{impact}</strong></article>)}</aside>
+      <section className="twin-radar"><div><span className="kicker">DYNAMIC HOUSEHOLD MODEL</span><h3>Readiness balance</h3><p>{strongest[0]} is your strongest area ({strongest[1]}%). {weakest[1]<100?`${weakest[0]} creates the most exposure (${weakest[1]}%).`:"Every area is fully covered."}</p></div><div className="household-radar"><svg viewBox="0 0 220 190"><g className="radar-grid"><polygon points="110,18 190,60 190,138 110,178 30,138 30,60"/><polygon points="110,46 163,74 163,124 110,150 57,124 57,74"/><line x1="110" y1="18" x2="110" y2="98"/><line x1="190" y1="60" x2="110" y2="98"/><line x1="190" y1="138" x2="110" y2="98"/><line x1="110" y1="178" x2="110" y2="98"/><line x1="30" y1="138" x2="110" y2="98"/><line x1="30" y1="60" x2="110" y2="98"/></g><polygon className="radar-value" points={radar}/></svg><span className="radar-l r-people">People</span><span className="radar-l r-pets">Pets</span><span className="radar-l r-transport">Transport</span><span className="radar-l r-resources">Supplies</span><span className="radar-l r-communication">Communication</span><span className="radar-l r-evacuation">Evacuation</span></div></section>
+      <aside className="command-insights"><span className="kicker">READINESS INSIGHTS</span><h3>{a.gaps.length?`${Math.min(a.gaps.length,3)} ways to strengthen your household`:"Your household plan is complete"}</h3>{a.gaps.slice(0,3).map((gap,i)=><article key={gap.title}><span className={`insight-rank rank-${i}`}>{i+1}</span><div><b>{gap.title}</b><p>{gap.copy}</p></div><strong>{gap.points?`+${gap.points} pts`:"Setup"}</strong></article>)}</aside>
     </div>
     <section className={`evac-simulation ${simulation?"has-result":""}`}><div className="simulation-copy"><span className="simulation-icon"><Icon name="route"/></span><div><span className="kicker">HOUSEHOLD IMPACT SIMULATION</span><h3>How prepared are we if evacuation happens right now?</h3><p>Test your current people, pet, communication, vehicle, and supply readiness together.</p></div></div><Button onClick={()=>setSimulation(!simulation)}>{simulation?"Close results":"Run Evacuation Simulation"} <Icon name="arrow"/></Button>
-      {simulation&&<div className="simulation-result"><div className="success-gauge"><strong>78%</strong><span>estimated evacuation success</span></div><div className="simulation-checks">{[["People readiness","Ready","green"],["Pet readiness","Limited","orange"],["Communication reliability","Needs backup","orange"],["Vehicle availability","Ready","green"],["Resource coverage","84%","green"]].map(([label,value,tone])=><div key={label}><span className={`sim-dot ${tone}`}/><b>{label}</b><strong>{value}</strong></div>)}</div><div className="simulation-verdict"><Icon name="spark"/><p><b>Primary constraint: communication reliability.</b> Add an out-of-area contact and print emergency contact cards for children to improve the result.</p></div></div>}
+      {simulation&&<div className="simulation-result"><div className="success-gauge"><strong>{success}%</strong><span>estimated evacuation readiness</span></div><div className="simulation-checks">{checks.map(([label,value,t])=><div key={label}><span className={`sim-dot ${t}`}/><b>{label}</b><strong>{value}</strong></div>)}</div><div className="simulation-verdict"><Icon name="spark"/><p><b>Primary constraint: {weakest[0].toLowerCase()}.</b> {a.gaps[0]?`${a.gaps[0].title}: ${a.gaps[0].copy}`:"No gaps found. Keep checking supplies every six months."}</p></div></div>}
     </section>
   </div>;
 }
 
 function PeopleModule() {
-  const [members,setMembers]=useState([
-    {name:"Brinda",initials:"BR",role:"Primary decision maker",need:"Emergency plan owner",score:90,tone:"green"},
-    {name:"Robert",initials:"RO",role:"Older adult",need:"Mobility assistance required",score:65,tone:"orange"},
-    {name:"Maya",initials:"MA",role:"Child · age 9",need:"Child safety plan",score:74,tone:"blue"},
-  ]);
-  const [assignments,setAssignments]=useState<Record<string,string>>({"Emergency Contact Manager":"Brinda","Pet Coordinator":"Maya","Supply Manager":"Robert","Vehicle Coordinator":"Brinda"});
+  const user = useCurrentUser();
+  const { profile, update } = useHousehold();
+  const owner:Member={id:OWNER_ID,name:user.firstName,...profile.owner};
+  const members=[owner,...profile.members];
+  const nameOf=(id:string)=>members.find(member=>member.id===id)?.name??"Removed member";
   const [draggedRole,setDraggedRole]=useState("");
-  const roles=["Emergency Contact Manager","Pet Coordinator","Supply Manager","Vehicle Coordinator","Child Safety Lead"];
-  const assign=(role:string,person:string)=>setAssignments(current=>({...current,[role]:person}));
-  const addPerson=()=>{if(members.some(member=>member.name==="Noah"))return;setMembers(current=>[...current,{name:"Noah",initials:"NO",role:"Child · age 6",need:"Requires emergency contact card",score:58,tone:"orange"}])};
+  const [editing,setEditing]=useState<string|null>(null); // member id, or "new"
+  const assign=(role:string,memberId:string)=>update(p=>({...p,roles:{...p.roles,[role]:memberId}}));
+  const unassign=(role:string)=>update(p=>{const roles={...p.roles};delete roles[role];return {...p,roles}});
+  const saveMember=(m:Member)=>update(p=>m.id===OWNER_ID
+    ?{...p,owner:{type:m.type,age:m.age,supportNeeds:m.supportNeeds,planReady:m.planReady}}
+    :p.members.some(x=>x.id===m.id)?{...p,members:p.members.map(x=>x.id===m.id?m:x)}:{...p,members:[...p.members,m]});
+  const removeMember=(id:string)=>update(p=>({...p,members:p.members.filter(m=>m.id!==id),roles:Object.fromEntries(Object.entries(p.roles).filter(([,v])=>v!==id))}));
+  const assignedCount=ROLES.filter(role=>profile.roles[role]).length;
   return <div className="people-module">
-    <div className="module-toolbar"><div><span className="kicker">HOUSEHOLD MAP</span><h3>{members.length} people in this preparedness plan</h3><p>Each person has an individual role, support profile, and evacuation readiness status.</p></div><Button onClick={addPerson} disabled={members.some(member=>member.name==="Noah")}>{members.some(member=>member.name==="Noah")?"Person added":"Add Person"}</Button></div>
-    {members.some(member=>member.name==="Noah")&&<div className="impact-update"><Icon name="spark"/><div><b>Household model updated</b><span>Adding a child created 3 new recommendations for contact cards, comfort supplies, and reunification planning.</span></div><strong>−2 current pts</strong></div>}
-    <div className="person-grid">{members.map(member=><article className="person-card" key={member.name} onDragOver={event=>event.preventDefault()} onDrop={()=>{if(draggedRole)assign(draggedRole,member.name);setDraggedRole("")}}><div className={`person-avatar avatar-${member.tone}`}>{member.initials}</div><div className="person-title"><div><h4>{member.name}</h4><span>{member.role}</span></div><Badge tone={member.score<70?"orange":"green"}>{member.score<70?"NEEDS SUPPORT":"READY"}</Badge></div><div className="person-need"><Icon name={member.score<70?"help":"shield"} size={15}/><span>{member.need}</span></div><div className="person-readiness"><div><span>Evacuation readiness</span><b>{member.score}%</b></div><div className="progress"><i style={{width:`${member.score}%`}}/></div></div><div className="person-actions"><button>Edit profile</button><button>Set support needs</button></div></article>)}</div>
-    <section className="role-board"><div className="role-board-head"><div><span className="kicker">EMERGENCY RESPONSIBILITIES</span><h3>Role coverage</h3><p>Drag a responsibility onto a household member card, or select an unassigned role to assign it to Brinda.</p></div><div className="coverage-score"><b>{Object.keys(assignments).length}/5</b><span>complete</span></div></div><div className="role-list">{roles.map(role=><button draggable onDragStart={()=>setDraggedRole(role)} onClick={()=>{if(!assignments[role])assign(role,"Brinda")}} className={assignments[role]?"assigned":""} key={role}><span className="drag-handle">••</span><div><b>{role}</b><small>{assignments[role]?`Assigned to ${assignments[role]}`:"Unassigned · drag to a person"}</small></div>{assignments[role]?<Icon name="check"/>:<Icon name="chevron"/>}</button>)}</div></section>
+    <div className="module-toolbar"><div><span className="kicker">HOUSEHOLD MAP</span><h3>{plural(members.length,"person")} in this preparedness plan</h3><p>Each person has a role, support needs, and a confirmed go-bag and plan.</p></div><Button onClick={()=>setEditing("new")} disabled={editing==="new"}>Add Person</Button></div>
+    <div className="person-grid">{members.map(member=>{
+      const isOwner=member.id===OWNER_ID;
+      if(editing===member.id)return <article className="person-card editing" key={member.id}><h4>Edit {isOwner?"your details":member.name}</h4><MemberForm initial={member} isOwner={isOwner} onSave={m=>{saveMember(m);setEditing(null)}} onCancel={()=>setEditing(null)}/></article>;
+      const status=member.planReady?"READY":member.supportNeeds?"NEEDS SUPPORT":"PLAN NEEDED";
+      return <article className="person-card" key={member.id} onDragOver={event=>event.preventDefault()} onDrop={()=>{if(draggedRole)assign(draggedRole,member.id);setDraggedRole("")}}>
+        <div className={`person-avatar avatar-${member.planReady?"green":member.supportNeeds?"orange":"blue"}`}>{isOwner?user.initials:initials(member.name)}</div>
+        <div className="person-title"><div><h4>{member.name}{isOwner&&<small className="you-tag">You</small>}</h4><span>{memberLabel(member)}</span></div><Badge tone={member.planReady?"green":"orange"}>{status}</Badge></div>
+        <div className="person-need"><Icon name={member.supportNeeds?"help":"shield"} size={15}/><span>{member.supportNeeds||"No support needs noted"}</span></div>
+        <div className="person-actions"><button onClick={()=>saveMember({...member,planReady:!member.planReady})}>{member.planReady?"✓ Go-bag & plan ready":"Mark go-bag & plan ready"}</button><button onClick={()=>setEditing(member.id)}>Edit profile</button>{!isOwner&&<button className="danger-link" onClick={()=>removeMember(member.id)}>Remove</button>}</div>
+      </article>;
+    })}
+    {editing==="new"&&<article className="person-card editing"><h4>Add a household member</h4><MemberForm submitLabel="Add person" onSave={m=>{saveMember(m);setEditing(null)}} onCancel={()=>setEditing(null)}/></article>}</div>
+    <section className="role-board"><div className="role-board-head"><div><span className="kicker">EMERGENCY RESPONSIBILITIES</span><h3>Role coverage</h3><p>Drag a responsibility onto a household member card, or select an unassigned role to assign it to {owner.name}. Select an assigned role to clear it.</p></div><div className="coverage-score"><b>{assignedCount}/{ROLES.length}</b><span>complete</span></div></div><div className="role-list">{ROLES.map(role=>{
+      const assigned=profile.roles[role];
+      return <button draggable onDragStart={()=>setDraggedRole(role)} onClick={()=>assigned?unassign(role):assign(role,OWNER_ID)} className={assigned?"assigned":""} key={role}><span className="drag-handle">••</span><div><b>{role}</b><small>{assigned?`Assigned to ${nameOf(assigned)}`:"Unassigned · drag to a person"}</small></div>{assigned?<Icon name="check"/>:<Icon name="chevron"/>}</button>;
+    })}</div></section>
   </div>;
 }
 
 function PetsModule() {
+  const { profile, update } = useHousehold();
+  const a = analyzeHousehold(profile);
   const [simulation,setSimulation]=useState(false);
-  const [carrierReady,setCarrierReady]=useState(false);
-  const score=carrierReady?92:72;
-  return <div className="pets-module"><div className="module-toolbar"><div><span className="kicker">PET EVACUATION PROFILES</span><h3>Every pet needs a way out</h3><p>Track transportation, medical records, supplies, and a verified emergency contact for each animal.</p></div><Button variant="secondary">Add Pet</Button></div>
-    <div className="pet-grid"><article className="pet-card"><div className="pet-portrait pet-dog"><Icon name="pet" size={32}/></div><div className="pet-card-head"><div><h4>Luna</h4><span>Dog · 6 years</span></div><strong>{score}%</strong></div><div className="progress"><i style={{width:`${score}%`}}/></div><div className="pet-checks"><span className={carrierReady?"done":"missing"}><Icon name={carrierReady?"check":"close"} size={13}/> Carrier</span><span className="done"><Icon name="check" size={13}/> Medications</span><span className="done"><Icon name="check" size={13}/> Emergency contact</span></div><Button variant={carrierReady?"secondary":"primary"} onClick={()=>setCarrierReady(!carrierReady)}>{carrierReady?"Carrier confirmed":"Confirm carrier"}</Button></article>
-    <article className="pet-card"><div className="pet-portrait pet-cat"><Icon name="pet" size={32}/></div><div className="pet-card-head"><div><h4>Milo</h4><span>Cat · 3 years</span></div><strong>68%</strong></div><div className="progress"><i style={{width:"68%"}}/></div><div className="pet-checks"><span className="done"><Icon name="check" size={13}/> Carrier</span><span className="missing"><Icon name="close" size={13}/> Vaccination records</span><span className="missing"><Icon name="close" size={13}/> Pet supply kit</span></div><Button variant="secondary">Complete profile</Button></article></div>
-    <section className="pet-simulator"><div><span className="kicker">PET EVACUATION SIMULATOR</span><h3>What happens if evacuation occurs today?</h3></div><Button onClick={()=>setSimulation(!simulation)}>{simulation?"Reset simulation":"Run readiness check"} <Icon name="arrow"/></Button>{simulation&&<div className="pet-sim-result">{[["Family members",true],["Household supplies",true],["Pet supplies",false],["Pet transportation",carrierReady]].map(([label,ready])=><div className={ready?"ready":"blocked"} key={label as string}><Icon name={ready?"check":"close"}/><span>{label as string}</span><b>{ready?"Ready":"Not ready"}</b></div>)}<p><Icon name="help"/><span><b>Evacuation readiness is limited by pet transportation.</b> Confirm Luna's carrier and complete Milo's supply kit before the next high-risk day.</span></p></div>}</section>
+  const [editing,setEditing]=useState<string|null>(null);
+  const savePet=(pet:Pet)=>update(p=>({...p,pets:p.pets.some(x=>x.id===pet.id)?p.pets.map(x=>x.id===pet.id?pet:x):[...p.pets,pet]}));
+  const removePet=(id:string)=>update(p=>({...p,pets:p.pets.filter(x=>x.id!==id)}));
+  const toggle=(pet:Pet,check:keyof Pet["checks"])=>savePet({...pet,checks:{...pet.checks,[check]:!pet.checks[check]}});
+  const allCarriers=profile.pets.every(pet=>pet.checks.carrier), allKits=profile.pets.every(pet=>pet.checks.supplyKit);
+  const sim:[string,boolean][]=[["Family members",a.people===100],["Household supplies",a.resources>=75],["Pet supplies",allKits],["Pet transportation",allCarriers]];
+  const blocker=sim.find(([,ok])=>!ok);
+  return <div className="pets-module"><div className="module-toolbar"><div><span className="kicker">PET EVACUATION PROFILES</span><h3>Every pet needs a way out</h3><p>Track transportation, medical records, supplies, and a verified emergency contact for each animal.</p></div><Button variant="secondary" onClick={()=>setEditing("new")} disabled={editing==="new"}>Add Pet</Button></div>
+    {profile.pets.length===0&&editing!=="new"&&<EmptyState icon="pet" title="No pets added" copy="Add your pets so ReadyCA can plan carriers, supplies, and vehicle space for them."/>}
+    <div className="pet-grid">{profile.pets.map(pet=>{
+      if(editing===pet.id)return <article className="pet-card editing" key={pet.id}><h4>Edit {pet.name}</h4><PetForm initial={pet} onSave={p=>{savePet(p);setEditing(null)}} onCancel={()=>setEditing(null)}/></article>;
+      const score=petScore(pet);
+      return <article className="pet-card" key={pet.id}><RemoveButton label={`Remove ${pet.name}`} onClick={()=>removePet(pet.id)}/><div className={`pet-portrait ${pet.species==="Cat"?"pet-cat":"pet-dog"}`}><Icon name="pet" size={32}/></div><div className="pet-card-head"><div><h4>{pet.name}</h4><span>{pet.species}{pet.age!=null?` · ${plural(pet.age,"year")}`:""}</span></div><strong>{score}%</strong></div><div className="progress"><i style={{width:`${score}%`}}/></div>
+        <div className="pet-checks">{PET_CHECKS.map(([key,label])=><button className="pet-check" key={key} onClick={()=>toggle(pet,key)} aria-pressed={pet.checks[key]}><span className={pet.checks[key]?"done":"missing"}><Icon name={pet.checks[key]?"check":"close"} size={13}/> {label}</span></button>)}</div>
+        <Button variant="secondary" onClick={()=>setEditing(pet.id)}>Edit profile</Button></article>;
+    })}
+    {editing==="new"&&<article className="pet-card editing"><h4>Add a pet</h4><PetForm submitLabel="Add pet" onSave={p=>{savePet(p);setEditing(null)}} onCancel={()=>setEditing(null)}/></article>}</div>
+    {profile.pets.length>0&&<section className="pet-simulator"><div><span className="kicker">PET EVACUATION SIMULATOR</span><h3>What happens if evacuation occurs today?</h3></div><Button onClick={()=>setSimulation(!simulation)}>{simulation?"Reset simulation":"Run readiness check"} <Icon name="arrow"/></Button>{simulation&&<div className="pet-sim-result">{sim.map(([label,ready])=><div className={ready?"ready":"blocked"} key={label}><Icon name={ready?"check":"close"}/><span>{label}</span><b>{ready?"Ready":"Not ready"}</b></div>)}<p><Icon name={blocker?"help":"check"}/><span>{blocker?<><b>Evacuation readiness is limited by {blocker[0].toLowerCase()}.</b> {a.gaps.find(g=>g.title.includes("evacuation profile")||g.title.includes("plan"))?.copy??"Resolve this before the next high-risk day."}</>:<b>Your pets are ready to evacuate.</b>}</span></p></div>}</section>}
   </div>;
 }
 
 function TransportationModule() {
+  const { profile, update } = useHousehold();
   const [primaryUnavailable,setPrimaryUnavailable]=useState(false);
-  const capacity=primaryUnavailable?5:10;
-  const score=primaryUnavailable?67:91;
-  return <div className="transport-module"><div className="vehicle-summary"><div><span className="kicker">VEHICLE READINESS</span><b>{score}%</b><p>{primaryUnavailable?"Backup vehicle can carry everyone, but battery range creates less flexibility.":"Both vehicles are available and your household has sufficient evacuation capacity."}</p></div><div className="capacity-visual"><span>CAPACITY REQUIRED</span><div><b>6</b><i>/</i><strong>{capacity}</strong><small>people + pets / seats</small></div><Badge tone={capacity>=6?"green":"orange"}>{capacity>=6?"CAPACITY SUFFICIENT":"CAPACITY RISK"}</Badge></div></div>
-    <div className="vehicle-grid"><article className={`vehicle-card ${primaryUnavailable?"unavailable":""}`}><div className="vehicle-art"><Icon name="car" size={34}/><Badge tone={primaryUnavailable?"gray":"green"}>{primaryUnavailable?"UNAVAILABLE":"EVACUATION READY"}</Badge></div><h4>Honda CR-V</h4><span>Primary vehicle · 5 seats</span><div className="energy-row"><div><span>FUEL LEVEL</span><b>{primaryUnavailable?"—":"70%"}</b></div><div className="fuel-meter"><i style={{width:primaryUnavailable?"0%":"70%"}}/></div></div><div className="vehicle-stats"><span><b>310 mi</b>Estimated range</span><span><b>✓</b>Primary route</span><span><b>✓</b>Backup route</span></div></article>
-    <article className="vehicle-card warning"><div className="vehicle-art"><Icon name="car" size={34}/><Badge tone="orange">CHARGE RECOMMENDED</Badge></div><h4>Tesla Model Y</h4><span>Backup vehicle · 5 seats</span><div className="energy-row"><div><span>BATTERY LEVEL</span><b>42%</b></div><div className="fuel-meter"><i style={{width:"42%"}}/></div></div><div className="vehicle-stats"><span><b>128 mi</b>Estimated range</span><span><b>✓</b>Primary route</span><span><b>!</b>Potential range risk</span></div></article></div>
-    <section className="what-if"><div><span className="kicker">WHAT-IF SIMULATION</span><h3>What if the primary vehicle is unavailable?</h3><p>ReadyCA recalculates capacity, route options, and household readiness in real time.</p></div><button className={`simulation-toggle ${primaryUnavailable?"on":""}`} onClick={()=>setPrimaryUnavailable(!primaryUnavailable)}><i/><span>{primaryUnavailable?"Primary unavailable":"Primary available"}</span></button>{primaryUnavailable&&<div className="recalculation"><span><b>+11 min</b> evacuation time</span><span><b>5 seats</b> available capacity</span><span><b>−24 pts</b> vehicle readiness</span><strong>Backup route still compatible</strong></div>}</section>
+  const [editing,setEditing]=useState<string|null>(null);
+  const a=analyzeHousehold(profile);
+  const backupOnly=analyzeHousehold({...profile,vehicles:profile.vehicles.slice(1)});
+  const unavailable=primaryUnavailable&&profile.vehicles.length>0;
+  const capacity=unavailable?a.seatsWithoutPrimary:a.seats;
+  const score=unavailable?backupOnly.transportation:a.transportation;
+  const saveVehicle=(v:Vehicle)=>update(p=>({...p,vehicles:p.vehicles.some(x=>x.id===v.id)?p.vehicles.map(x=>x.id===v.id?v:x):[...p.vehicles,v]}));
+  const removeVehicle=(id:string)=>update(p=>({...p,vehicles:p.vehicles.filter(x=>x.id!==id)}));
+  const makePrimary=(id:string)=>update(p=>({...p,vehicles:[...p.vehicles.filter(x=>x.id===id),...p.vehicles.filter(x=>x.id!==id)]}));
+  const summary=profile.vehicles.length===0?"Add the vehicles your household would use to evacuate.":unavailable?(capacity>=a.seatsNeeded?"Your backup vehicles can still carry everyone.":"Without the primary vehicle, not everyone has a seat."):(capacity>=a.seatsNeeded?`Your vehicles have enough seats for everyone (${a.seatsNeeded} people and pets).`:"Your vehicles don't have enough seats for everyone.");
+  return <div className="transport-module"><div className="vehicle-summary"><div><span className="kicker">VEHICLE READINESS</span><b>{score}%</b><p>{summary}</p></div><div className="capacity-visual"><span>CAPACITY REQUIRED</span><div><b>{a.seatsNeeded}</b><i>/</i><strong>{capacity}</strong><small>people + pets / seats</small></div><Badge tone={capacity>=a.seatsNeeded?"green":"orange"}>{capacity>=a.seatsNeeded?"CAPACITY SUFFICIENT":"CAPACITY RISK"}</Badge></div></div>
+    <div className="module-toolbar"><div><span className="kicker">YOUR VEHICLES</span><h3>{plural(profile.vehicles.length,"vehicle")}</h3><p>The first vehicle is your primary evacuation vehicle. Keep fuel or charge above half during fire season.</p></div><Button variant="secondary" onClick={()=>setEditing("new")} disabled={editing==="new"}>Add Vehicle</Button></div>
+    {profile.vehicles.length===0&&editing!=="new"&&<EmptyState icon="car" title="No vehicles added" copy="Add a vehicle so ReadyCA can check seating and fuel for your evacuation."/>}
+    <div className="vehicle-grid">{profile.vehicles.map((v,i)=>{
+      if(editing===v.id)return <article className="vehicle-card editing" key={v.id}><h4>Edit {v.name}</h4><VehicleForm initial={v} onSave={x=>{saveVehicle(x);setEditing(null)}} onCancel={()=>setEditing(null)}/></article>;
+      const off=unavailable&&i===0, low=v.level<50;
+      const levelLabel=v.power==="Electric"?"BATTERY LEVEL":v.power==="Hybrid"?"FUEL / CHARGE":"FUEL LEVEL";
+      return <article className={`vehicle-card ${off?"unavailable":low?"warning":""}`} key={v.id}><RemoveButton label={`Remove ${v.name}`} onClick={()=>removeVehicle(v.id)}/><div className="vehicle-art"><Icon name="car" size={34}/><Badge tone={off?"gray":low?"orange":"green"}>{off?"UNAVAILABLE":low?(v.power==="Electric"?"CHARGE RECOMMENDED":"REFUEL RECOMMENDED"):"EVACUATION READY"}</Badge></div><h4>{v.name}</h4><span>{i===0?"Primary":"Backup"} vehicle · {plural(v.seats,"seat")} · {v.power}</span>
+        <div className="energy-row"><div><span>{levelLabel}</span><b>{off?"—":`${v.level}%`}</b></div><input className="level-input" type="range" min={0} max={100} step={5} value={v.level} aria-label={`${v.name} ${levelLabel.toLowerCase()}`} onChange={e=>saveVehicle({...v,level:Number(e.target.value)})}/></div>
+        <div className="person-actions">{i>0&&<button onClick={()=>makePrimary(v.id)}>Make primary</button>}<button onClick={()=>setEditing(v.id)}>Edit vehicle</button></div></article>;
+    })}
+    {editing==="new"&&<article className="vehicle-card editing"><h4>Add a vehicle</h4><VehicleForm submitLabel="Add vehicle" onSave={x=>{saveVehicle(x);setEditing(null)}} onCancel={()=>setEditing(null)}/></article>}</div>
+    {profile.vehicles.length>0&&<section className="what-if"><div><span className="kicker">WHAT-IF SIMULATION</span><h3>What if the primary vehicle is unavailable?</h3><p>ReadyCA recalculates capacity and household readiness using only your backup vehicles.</p></div><button className={`simulation-toggle ${primaryUnavailable?"on":""}`} onClick={()=>setPrimaryUnavailable(!primaryUnavailable)}><i/><span>{primaryUnavailable?"Primary unavailable":"Primary available"}</span></button>{unavailable&&<div className="recalculation"><span><b>{plural(a.seatsWithoutPrimary,"seat")}</b> available capacity</span><span><b>{backupOnly.transportation-a.transportation} pts</b> vehicle readiness</span><strong>{a.seatsWithoutPrimary>=a.seatsNeeded?"Backup vehicles can carry everyone":"Not enough seats without the primary vehicle"}</strong></div>}</section>}
   </div>;
 }
 
+// Communication tree slots: one node per contact type, positioned by the existing node-a..d styles.
+const CONTACT_SLOTS:[ContactKind,string,string,boolean][]=[["Emergency contact","node-a","EC",true],["Out-of-area contact","node-b","OA",true],["School / childcare","node-c","CH",false],["Neighbor","node-d","NB",false]];
+
 function CommunicationModule() {
+  const user = useCurrentUser();
+  const { profile, update } = useHousehold();
+  const a=analyzeHousehold(profile);
   const [stress,setStress]=useState(false);
-  const [outOfArea,setOutOfArea]=useState(false);
-  const score=outOfArea?(stress?78:88):(stress?61:76);
-  return <div className="communication-module"><div className="comm-summary"><div><span className="kicker">COMMUNICATION READINESS</span><b>{score}%</b><p>{stress?"Cell service outage simulated. Radio and messaging backups remain available.":"Your primary network is connected, but one critical fallback contact is missing."}</p></div><div className="comm-checklist">{[["Primary contact",true],["Backup contact",true],["Out-of-area contact",outOfArea],["Emergency meeting point",true]].map(([label,ready])=><span className={ready?"ready":"missing"} key={label as string}><Icon name={ready?"check":"close"} size={13}/>{label as string}</span>)}</div></div>
-    <section className="network-builder"><div className="network-head"><div><span className="kicker">COMMUNICATION TREE</span><h3>Your emergency contact network</h3></div><Button variant="secondary">Add Contact</Button></div><div className="network-canvas"><div className="network-lines"/><div className="network-node root-node"><span>BR</span><b>Brinda</b><small>Plan owner</small></div><div className="network-node node-a"><span>EC</span><b>Emergency contact</b><small>Robert · verified</small></div><div className={`network-node node-b ${outOfArea?"":"node-missing"}`}><span>{outOfArea?"OA":"+"}</span><b>{outOfArea?"Out-of-area contact":"Contact missing"}</b><small>{outOfArea?"Lisa · Arizona":"Recommended fallback"}</small></div><div className="network-node node-c"><span>CH</span><b>Child contact</b><small>School card ready</small></div><div className="network-node node-d"><span>NB</span><b>Neighbor</b><small>Mutual support</small></div></div></section>
-    {!outOfArea&&<div className="comm-gap"><span><Icon name="help"/></span><div><b>No out-of-area emergency contact</b><p>Local networks may be congested or unavailable during a regional emergency.</p></div><strong>+4 pts</strong><Button onClick={()=>setOutOfArea(true)}>Quick fix</Button></div>}
+  const [adding,setAdding]=useState<ContactKind|null>(null);
+  const [meetingPoint,setMeetingPoint]=useState(profile.meetingPoint);
+  useEffect(()=>setMeetingPoint(profile.meetingPoint),[profile.meetingPoint]);
+  const addContact=(c:Contact)=>{update(p=>({...p,contacts:[...p.contacts,c]}));setAdding(null)};
+  const removeContact=(id:string)=>update(p=>({...p,contacts:p.contacts.filter(c=>c.id!==id)}));
+  const hasOutOfArea=profile.contacts.some(c=>c.kind==="Out-of-area contact");
+  return <div className="communication-module"><div className="comm-summary"><div><span className="kicker">COMMUNICATION READINESS</span><b>{a.communication}%</b><p>{stress?"Cell service outage simulated. Text, messaging, and radio backups remain available.":a.communication===100?"Your contact network and meeting point are complete.":"Your contact network has gaps. Complete the items below to make sure everyone can reconnect."}</p></div><div className="comm-checklist">{a.commChecks.map(([label,ready])=><span className={ready?"ready":"missing"} key={label}><Icon name={ready?"check":"close"} size={13}/>{label}</span>)}</div></div>
+    <section className="network-builder"><div className="network-head"><div><span className="kicker">COMMUNICATION TREE</span><h3>Your emergency contact network</h3></div><Button variant="secondary" onClick={()=>setAdding("Emergency contact")}>Add Contact</Button></div><div className="network-canvas"><div className="network-lines"/><div className="network-node root-node"><span>{user.initials}</span><b>{user.firstName}</b><small>Plan owner</small></div>
+      {CONTACT_SLOTS.map(([kind,slot,abbr,recommended])=>{
+        const matches=profile.contacts.filter(c=>c.kind===kind);
+        const first=matches[0];
+        if(!first)return <button className={`network-node ${slot} node-missing`} key={kind} onClick={()=>setAdding(kind)}><span>+</span><b>Add {kind.toLowerCase()}</b><small>{recommended?"Recommended":"Optional"}</small></button>;
+        return <div className={`network-node ${slot}`} key={kind}><span>{abbr}</span><b>{kind}</b><small>{first.name}{first.detail?` · ${first.detail}`:""}{matches.length>1?` +${matches.length-1}`:""}</small></div>;
+      })}</div>
+      {adding&&<div className="hh-inline"><h4>Add a contact</h4><ContactForm key={adding} kind={adding} submitLabel="Add contact" onSave={addContact} onCancel={()=>setAdding(null)}/></div>}
+      {profile.contacts.length>0&&<ul className="hh-list">{profile.contacts.map(c=><li key={c.id}><span className="hh-list-initials">{initials(c.name)}</span><div><b>{c.name}</b><small>{c.kind}{c.detail?` · ${c.detail}`:""}</small></div><RemoveButton label={`Remove ${c.name}`} onClick={()=>removeContact(c.id)}/></li>)}</ul>}
+      <form className="hh-form hh-meeting" onSubmit={e=>{e.preventDefault();update(p=>({...p,meetingPoint:tidy(meetingPoint)}))}}><label className="hh-wide">Emergency meeting point<input value={meetingPoint} maxLength={80} placeholder="e.g. Library parking lot on Main St" onChange={e=>setMeetingPoint(e.target.value)}/></label><FormActions submitLabel={profile.meetingPoint&&tidy(meetingPoint)===profile.meetingPoint?"Saved":"Save meeting point"}/></form>
+    </section>
+    {!hasOutOfArea&&<div className="comm-gap"><span><Icon name="help"/></span><div><b>No out-of-area emergency contact</b><p>Local networks may be congested or unavailable during a regional emergency.</p></div><strong>+4 pts</strong><Button onClick={()=>setAdding("Out-of-area contact")}>Quick fix</Button></div>}
     <section className="stress-test"><div><span className="kicker">COMMUNICATION STRESS TEST</span><h3>Cell service unavailable</h3><p>See which contact methods remain reliable when normal voice service fails.</p></div><button className={`simulation-toggle ${stress?"on":""}`} onClick={()=>setStress(!stress)}><i/><span>{stress?"Outage active":"Run stress test"}</span></button>{stress&&<div className="method-results">{[["Text message",true],["WhatsApp",true],["Emergency radio",true],["Voice call",false]].map(([method,works])=><span className={works?"works":"fails"} key={method as string}><Icon name={works?"check":"close"}/><b>{method as string}</b><small>{works?"Available":"Unavailable"}</small></span>)}</div>}</section>
   </div>;
 }
 
-function Household() {
+function SaveStatus({onSignIn}:{onSignIn:()=>void}) {
+  const { saveState, saveError } = useHousehold();
+  if(saveState==="local")return <div className="save-status local"><Icon name="help" size={15}/><span>You're exploring a sample household. Changes aren't saved.</span><Button variant="secondary" onClick={onSignIn}>Sign in to save</Button></div>;
+  if(saveState==="error")return <div className="save-status error" role="alert"><Icon name="close" size={15}/><span>{saveError?.startsWith("Couldn't")?saveError:`Couldn't save your household${saveError?` (${saveError})`:""}. Your latest changes may be lost.`}</span></div>;
+  return <div className={`save-status ${saveState}`} aria-live="polite"><Icon name={saveState==="saving"?"clock":"check"} size={15}/><span>{saveState==="saving"?"Saving…":"All changes saved to your account"}</span></div>;
+}
+
+function formatDay(iso:string){return new Date(`${iso}T12:00:00`).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}
+
+function Household({onSignIn}:{onSignIn:()=>void}) {
+  const { profile, update } = useHousehold();
+  const a=analyzeHousehold(profile);
   const [section,setSection]=useState("Overview");
-  const [resourceStatus,setResourceStatus]=useState<Record<string,ResourceStatus>>(() => Object.fromEntries(resourceCategories.flatMap(category => category.items.map(item => [item.name,item.status]))));
   const [expandedCategory,setExpandedCategory]=useState("Safety Equipment");
-  const groups:Record<string,[string,IconName,string[]]>={
-    Overview:["Command center","grid",[]],
-    People:["People","users",["Adults","Children","Older adults","Accessibility assistance"]],
-    Pets:["Pets","pet",["Dogs","Cats","Other animals","Pet carriers"]],
-    Transportation:["Transportation","car",["Vehicles","Accessible vehicles","Fuel ready","EV charging"]],
-    Communication:["Communication","phone",["Primary phone","Emergency contact","Out-of-area contact","Alert method"]],
-    Resources:["Household resources","box",["Water supply","Food supply","First aid kit","Backup power"]],
+  const [editingItem,setEditingItem]=useState<string|null>(null);
+  const groups:Record<string,[string,IconName]>={
+    Overview:["Command center","grid"], People:["People","users"], Pets:["Pets","pet"],
+    Transportation:["Transportation","car"], Communication:["Communication","phone"], Resources:["Household resources","box"],
   };
-  const allResources=resourceCategories.flatMap(category=>category.items);
-  const readyCount=allResources.filter(item=>resourceStatus[item.name]!=="missing").length;
-  const completion=Math.round(readyCount/allResources.length*100);
-  const resolvedGaps=allResources.filter(item=>item.status==="missing"&&resourceStatus[item.name]==="ready").length;
-  const resourceScore=18+resolvedGaps;
-  const gaps=allResources.filter(item=>resourceStatus[item.name]!=="ready");
-  const markReady=(name:string)=>setResourceStatus(current=>({...current,[name]:current[name]==="ready"?"missing":"ready"}));
+  const statusOf=(name:string)=>profile.resources[name]?.status??"missing";
+  const setResource=(name:string,change:Partial<HouseholdProfile["resources"][string]>)=>update(p=>({...p,resources:{...p.resources,[name]:{...p.resources[name],...change,updatedAt:new Date().toLocaleDateString("en-CA")}}})); // local YYYY-MM-DD, not UTC
+  const completion=a.resources;
+  const resourceScore=Math.round(a.resources/100*25);
+  const gaps=ALL_RESOURCES.filter(item=>statusOf(item.name)!=="ready");
   return <div><PageTitle kicker="PERSONALIZATION" title="Tell us about your household" copy="Your household profile helps ReadyCA personalize evacuation recommendations and identify preparedness gaps."/>
-    <div className="profile-progress card"><div><b>Your household profile is 78% complete</b><span>Complete 4 more details to improve your recommendations.</span></div><div className="progress"><i style={{width:"78%"}}/></div></div>
+    <div className="profile-progress card"><div><b>Your household profile is {a.completeness}% complete</b><span>{a.missingDetails?`Complete ${plural(a.missingDetails,"more detail")} to improve your recommendations.`:"Every detail is in place. Review it whenever your household changes."}</span></div><div className="progress"><i style={{width:`${a.completeness}%`}}/></div></div>
     <div className="profile-layout"><aside className="profile-nav">{Object.entries(groups).map(([key,[label,icon]])=><button className={section===key?"active":""} onClick={()=>setSection(key)} key={key}><Icon name={icon}/><span>{label}</span><Icon name="chevron" size={14}/></button>)}</aside>
     <section className={`card form-card ${section==="Resources"?"resource-inventory-card":""} ${section!=="Resources"?"household-module-card":""}`}><div className="card-heading"><div><Badge tone="blue">{section==="Resources"?"READINESS INVENTORY":section==="Overview"?"DIGITAL HOUSEHOLD TWIN":"INTERACTIVE HOUSEHOLD MODEL"}</Badge><h2>{groups[section][0]}</h2><p>{section==="Resources"?"Track what is ready, what needs attention, and where critical supplies are stored.":section==="Overview"?"A live model of the people, pets, vehicles, communication systems, and resources your household depends on.":"Update readiness visually and see how each change affects your evacuation plan."}</p></div><Icon name={groups[section][1]} size={28}/></div>
       {section==="Resources"?<div className="resource-inventory">
         <div className="inventory-summary">
-          <div className="inventory-completion"><div className="inventory-ring" style={{"--inventory-progress":`${completion*3.6}deg`} as React.CSSProperties}><strong>{completion}%</strong><span>complete</span></div><div><span className="kicker">HOUSEHOLD RESOURCE READINESS</span><h3>Your essential supplies are nearly ready</h3><p>{readyCount} of {allResources.length} tracked resources are available. Review the priority gaps below to strengthen your plan.</p></div></div>
+          <div className="inventory-completion"><div className="inventory-ring" style={{"--inventory-progress":`${completion*3.6}deg`} as React.CSSProperties}><strong>{completion}%</strong><span>complete</span></div><div><span className="kicker">HOUSEHOLD RESOURCE READINESS</span><h3>{completion>=90?"Your essential supplies are ready":completion>=60?"Your essential supplies are nearly ready":"Start building your emergency supplies"}</h3><p>{a.resourceReady} of {a.resourceTotal} tracked resources are ready. Review the priority gaps below to strengthen your plan.</p></div></div>
           <div className="resource-score"><span>RESOURCE READINESS</span><div><b>{resourceScore}</b><small>/ 25</small></div><p>Contributes directly to your overall readiness score.</p><button onClick={()=>setExpandedCategory("Emergency Supplies")}>View score contribution <Icon name="arrow" size={14}/></button></div>
         </div>
 
         <div className="inventory-toolbar"><div><span className="kicker">INVENTORY BY CATEGORY</span><h3>Preparedness inventory</h3></div><div className="inventory-legend"><span><i className="ready"/>Ready</span><span><i className="attention"/>Needs attention</span><span><i className="missing"/>Missing</span></div></div>
-        <div className="inventory-categories">{resourceCategories.map(category=>{
+        <div className="inventory-categories">{RESOURCE_CATALOG.map(category=>{
           const open=expandedCategory===category.name;
-          const categoryReady=category.items.filter(item=>resourceStatus[item.name]==="ready").length;
+          const categoryReady=category.items.filter(item=>statusOf(item.name)==="ready").length;
           return <section className={`inventory-category ${open?"open":""}`} key={category.name}>
             <button className="inventory-category-head" onClick={()=>setExpandedCategory(open?"":category.name)}>
               <span className="category-icon"><Icon name={category.icon}/></span><span><b>{category.name}</b><small>{categoryReady} of {category.items.length} ready</small></span><div className="mini-completion"><i style={{width:`${categoryReady/category.items.length*100}%`}}/></div><Icon name="chevron" size={16}/>
             </button>
             {open&&<div className="inventory-items">{category.items.map(item=>{
-              const status=resourceStatus[item.name];
+              const state=profile.resources[item.name];
+              const status=state?.status??"missing";
+              if(editingItem===item.name)return <ResourceEditor key={item.name} name={item.name} state={state} onSave={change=>{setResource(item.name,change);setEditingItem(null)}} onCancel={()=>setEditingItem(null)}/>;
               return <article className={`inventory-item status-${status}`} key={item.name}>
                 <span className="inventory-status">{status==="ready"?<Icon name="check" size={14}/>:status==="attention"?<Icon name="clock" size={14}/>:<Icon name="close" size={14}/>}</span>
-                <div className="inventory-item-main"><div><b>{item.name}</b><span className={`status-label ${status}`}>{status==="ready"?"Ready":status==="attention"?"Needs attention":"Missing"}</span></div><p><Icon name="pin" size={13}/>{item.detail}</p><small><Icon name="clock" size={12}/>{item.meta}</small></div>
-                <div className="inventory-quantity"><span>QUANTITY</span><b>{status==="missing"?"—":item.quantity}</b></div>
-                <button className={status==="ready"?"inventory-more":"inventory-fix"} onClick={()=>markReady(item.name)}>{status==="ready"?"Update":"Mark ready"}</button>
+                <div className="inventory-item-main"><div><b>{item.name}</b><span className={`status-label ${status}`}>{status==="ready"?"Ready":status==="attention"?"Needs attention":"Missing"}</span></div><p><Icon name="pin" size={13}/>{state?.location||(status==="missing"?"Not in inventory":"Storage location not set")}</p><small><Icon name="clock" size={12}/>{state?.updatedAt?`Updated ${formatDay(state.updatedAt)}`:item.why}</small></div>
+                <div className="inventory-quantity"><span>QUANTITY</span><b>{status==="missing"||!state?.quantity?"—":state.quantity}</b></div>
+                {status==="ready"?<button className="inventory-more" onClick={()=>setEditingItem(item.name)}>Update</button>:<button className="inventory-fix" onClick={()=>setResource(item.name,{status:"ready"})}>Mark ready</button>}
               </article>;
             })}</div>}
           </section>;
         })}</div>
 
-        <section className="gap-analysis"><div className="gap-heading"><div><span className="kicker">AUTOMATED GAP ANALYSIS</span><h3>{gaps.length} resource gaps need your attention</h3><p>Prioritized using your household size, location, and current inventory.</p></div><span className="ai-grounded"><Icon name="spark" size={15}/> Profile-informed</span></div>
-          <div className="gap-grid">{gaps.slice(0,3).map(item=><article className={`gap-card ${resourceStatus[item.name]}`} key={item.name}><div><span className="gap-icon"><Icon name={resourceStatus[item.name]==="attention"?"clock":"box"}/></span><Badge tone="orange">{resourceStatus[item.name]==="attention"?"CHECK QUANTITY":"MISSING ITEM"}</Badge></div><h4>{item.name}</h4><p>{item.why}</p><div className="gap-impact"><span>Readiness impact</span><b>+{item.impact||1} pts</b></div><Button variant="secondary" onClick={()=>markReady(item.name)}>{resourceStatus[item.name]==="attention"?"Update supply":"Add to inventory"} <Icon name="arrow" size={14}/></Button></article>)}</div>
+        <section className="gap-analysis"><div className="gap-heading"><div><span className="kicker">AUTOMATED GAP ANALYSIS</span><h3>{plural(gaps.length,"resource gap")} need{gaps.length===1?"s":""} your attention</h3><p>Prioritized by readiness impact for your household.</p></div><span className="ai-grounded"><Icon name="spark" size={15}/> Profile-informed</span></div>
+          <div className="gap-grid">{[...gaps].sort((x,y)=>y.impact-x.impact).slice(0,3).map(item=><article className={`gap-card ${statusOf(item.name)}`} key={item.name}><div><span className="gap-icon"><Icon name={statusOf(item.name)==="attention"?"clock":"box"}/></span><Badge tone="orange">{statusOf(item.name)==="attention"?"CHECK QUANTITY":"MISSING ITEM"}</Badge></div><h4>{item.name}</h4><p>{item.why}</p><div className="gap-impact"><span>Readiness impact</span><b>+{item.impact} pts</b></div><Button variant="secondary" onClick={()=>setResource(item.name,{status:"ready"})}>{statusOf(item.name)==="attention"?"Update supply":"Add to inventory"} <Icon name="arrow" size={14}/></Button></article>)}</div>
           {gaps.length===0&&<div className="all-ready"><Icon name="check"/><div><b>Your tracked resources are ready</b><span>Continue checking expiration dates and inspecting supplies every six months.</span></div></div>}
         </section>
       </div>:section==="Overview"?<HouseholdOverview/>:section==="People"?<PeopleModule/>:section==="Pets"?<PetsModule/>:section==="Transportation"?<TransportationModule/>:<CommunicationModule/>}
       {section==="Resources"&&<div className="insight"><Icon name="spark"/><div><b>Inventory insights improve your plan</b><span>ReadyCA uses your resource status to surface missing supplies, expiration risks, and score opportunities.</span></div></div>}
-      <div className="form-actions"><Button variant="secondary">Save & continue later</Button><Button>Save and continue <Icon name="arrow"/></Button></div>
+      <SaveStatus onSignIn={onSignIn}/>
     </section></div>
   </div>;
+}
+
+function ResourceEditor({name,state,onSave,onCancel}:{name:string;state?:HouseholdProfile["resources"][string];onSave:(change:{status:ResourceStatus;quantity:string;location:string})=>void;onCancel:()=>void}) {
+  const [status,setStatus]=useState<ResourceStatus>(state?.status??"ready");
+  const [quantity,setQuantity]=useState(state?.quantity??"");
+  const [location,setLocation]=useState(state?.location??"");
+  return <article className="inventory-item editing"><form className="hh-form" onSubmit={e=>{e.preventDefault();onSave({status,quantity:tidy(quantity),location:tidy(location)})}}>
+    <label className="hh-wide"><b>{name}</b></label>
+    <label>Status<select value={status} onChange={e=>setStatus(e.target.value as ResourceStatus)}><option value="ready">Ready</option><option value="attention">Needs attention</option><option value="missing">Missing</option></select></label>
+    <label>Quantity<input value={quantity} maxLength={20} placeholder="e.g. 6 gal" onChange={e=>setQuantity(e.target.value)}/></label>
+    <label>Stored at<input value={location} maxLength={60} placeholder="e.g. Garage shelf" onChange={e=>setLocation(e.target.value)}/></label>
+    <FormActions onCancel={onCancel} submitLabel="Save"/>
+  </form></article>;
 }
 
 const advisorResponses:Record<string,string>={
@@ -498,10 +779,13 @@ const advisorResponses:Record<string,string>={
 };
 function Advisor() {
   const [question,setQuestion]=useState("What should I do first?");
+  const { profile } = useHousehold();
+  const topGaps = analyzeHousehold(profile).gaps.slice(0, 2).map(g => g.title.toLowerCase());
+  const answers: Record<string, string> = { ...advisorResponses, "What should I do first?": topGaps.length ? `Based on your household profile, start with: ${topGaps.join(", then ")}. Complete these before lower-priority tasks.` : "Your household profile has no open gaps. Review supplies and practice your evacuation route every six months." };
   return <div><PageTitle kicker="EVIDENCE-GROUNDED GUIDANCE" title="AI Readiness Advisor" copy="Personalized wildfire preparedness guidance based on your household profile, readiness score, and trusted emergency-preparedness sources."/>
     <div className="grounded"><Icon name="shield"/> Grounded in your household profile + verified sources</div>
     <div className="advisor-layout"><section className="card chat"><div className="advisor-intro"><div className="ai-mark"><Icon name="spark"/></div><div><b>ReadyCA Advisor</b><span>AI-assisted recommendation</span></div></div>
-      <div className="message user-message">{question}</div><div className="message ai-message"><p>{advisorResponses[question]}</p><div className="citation"><Icon name="shield" size={14}/> Sources: CAL FIRE, Ready.gov, San Diego County OES</div></div>
+      <div className="message user-message">{question}</div><div className="message ai-message"><p>{answers[question]}</p><div className="citation"><Icon name="shield" size={14}/> Sources: CAL FIRE, Ready.gov{profile.location.county ? `, ${countyLabel(profile)} OES` : ", Cal OES"}</div></div>
       <div className="suggestions"><span>Ask a suggested question</span>{Object.keys(advisorResponses).map(q=><button className={q===question?"active":""} onClick={()=>setQuestion(q)} key={q}>{q}</button>)}</div>
       <div className="chat-input"><span>Ask about your readiness plan...</span><button><Icon name="arrow"/></button></div>
     </section><aside className="advisor-recs"><span className="kicker">RECOMMENDED FOR YOU</span><h2>Turn guidance into action</h2>{recommendations.slice(0,2).map(r=><article className="card advisor-card" key={r.title}><Badge tone="orange">{r.level.toUpperCase()}</Badge><h3>{r.title}</h3><div><span>Why this matters</span><p>{r.why}</p></div><div className="impact"><span>Estimated effort <b>{r.time}</b></span><span>Readiness impact <b>+{r.points} pts</b></span></div><div className="source"><Icon name="shield" size={14}/> Verified · {r.source}</div></article>)}</aside></div>
@@ -553,14 +837,21 @@ function Evidence() {
 }
 
 function Report({score}:{score:number}) {
+  const household = `${possessive(useCurrentUser().name)} household`;
+  const { profile } = useHousehold();
+  const a = analyzeHousehold(profile);
+  const county = countyLabel(profile) || "Location not set";
+  const strengths = a.strengths.length ? a.strengths.slice(0, 3) : ["Household profile started"];
+  const priorityGaps = a.gaps.slice(0, 3).map(g => g.title);
+  const summary = `${plural(a.peopleCount, "person")}${profile.pets.length ? ` and ${plural(profile.pets.length, "pet")}` : ""} in this plan. ${a.strengths.length ? `Strongest area: ${strengths[0].toLowerCase()}.` : "Your plan is just getting started."} ${a.gaps.length ? `${plural(a.gaps.length, "gap")} remain${a.gaps.length === 1 ? "s" : ""}, led by: ${a.gaps[0].title.toLowerCase()}.` : "No gaps remain in your household profile."}`;
   const [generated,setGenerated]=useState(false),[loading,setLoading]=useState(false);
   const generate=()=>{setLoading(true);window.setTimeout(()=>{setLoading(false);setGenerated(true)},1200)};
-  if(!generated)return <div><PageTitle kicker="PERSONALIZED SUMMARY" title="Your Family Preparedness Report" copy="Turn your profile and readiness progress into a clear, shareable household action plan."/><section className="card report-hero"><div className="report-illustration"><Icon name="file" size={48}/><i/></div><Badge tone="blue">AI-ASSISTED · EVIDENCE-GROUNDED</Badge><h2>A practical plan your whole family can use</h2><p>Your report summarizes strengths, priority gaps, evacuation planning, household needs, and next steps — with a verified source for every recommendation.</p><div className="report-features"><span><Icon name="check"/> Household-specific</span><span><Icon name="check"/> Source-linked</span><span><Icon name="check"/> Easy to share</span></div><Button onClick={generate} disabled={loading}>{loading?<><span className="spinner"/> Generating your report...</>:"Generate Report"}</Button><small>Uses your 78% complete household profile. You can update it anytime.</small></section></div>;
-  return <div><PageTitle kicker="GENERATED JUST NOW" title="Your Family Preparedness Report" copy="Personalized for Brinda's household · San Diego County"/>
+  if(!generated)return <div><PageTitle kicker="PERSONALIZED SUMMARY" title="Your Family Preparedness Report" copy="Turn your profile and readiness progress into a clear, shareable household action plan."/><section className="card report-hero"><div className="report-illustration"><Icon name="file" size={48}/><i/></div><Badge tone="blue">AI-ASSISTED · EVIDENCE-GROUNDED</Badge><h2>A practical plan your whole family can use</h2><p>Your report summarizes strengths, priority gaps, evacuation planning, household needs, and next steps — with a verified source for every recommendation.</p><div className="report-features"><span><Icon name="check"/> Household-specific</span><span><Icon name="check"/> Source-linked</span><span><Icon name="check"/> Easy to share</span></div><Button onClick={generate} disabled={loading}>{loading?<><span className="spinner"/> Generating your report...</>:"Generate Report"}</Button><small>Uses your {a.completeness}% complete household profile. You can update it anytime.</small></section></div>;
+  return <div><PageTitle kicker="GENERATED JUST NOW" title="Your Family Preparedness Report" copy={`Personalized for ${household} · ${county}`}/>
     <div className="report-actions"><Button variant="secondary" icon="download">Download Report</Button><Button variant="secondary">Share Report</Button><Button>Update My Plan</Button></div>
-    <section className="report-doc"><div className="report-cover"><div className="brand"><div className="brand-mark"><Icon name="flame"/></div><b>ReadyCA</b></div><span>HOUSEHOLD READINESS</span><div className="report-score">{score}<small>/ 100</small></div><Badge>GOOD PREPAREDNESS</Badge><p>Prepared for Brinda's household<br/>San Diego County, California</p></div>
-    <div className="report-body"><h2>Executive Summary</h2><p>Your household has strong transportation preparedness but several gaps remain in evacuation planning, emergency communication, and pet preparedness.</p><div className="report-cols"><div><span className="kicker">STRENGTHS</span>{["Multiple transportation options","Emergency supplies partially complete","Strong vehicle readiness"].map(x=><p key={x}><Icon name="check" size={16}/>{x}</p>)}</div><div><span className="kicker">PRIORITY GAPS</span>{["No documented meeting point","Pet evacuation plan incomplete","Communication tree incomplete"].map(x=><p key={x}><i/> {x}</p>)}</div></div>
-    <h2>Household Readiness Analytics</h2><div className="report-analytics"><div className="radar-card"><svg viewBox="0 0 180 160"><g className="radar-grid"><polygon points="90,12 160,55 135,140 45,140 20,55"/><polygon points="90,36 137,65 120,120 60,120 43,65"/><line x1="90" y1="12" x2="90" y2="82"/><line x1="160" y1="55" x2="90" y2="82"/><line x1="135" y1="140" x2="90" y2="82"/><line x1="45" y1="140" x2="90" y2="82"/><line x1="20" y1="55" x2="90" y2="82"/></g><polygon className="radar-value" points="90,27 147,60 126,126 65,112 38,62"/><g className="radar-points">{[[90,27],[147,60],[126,126],[65,112],[38,62]].map(([x,y])=><circle cx={x} cy={y} r="3" key={x}/>)}</g></svg><div className="radar-labels"><span>Evacuation</span><span>Transport</span><span>Supplies</span><span>Pets</span><span>Communication</span></div></div><div className="projection-card"><span className="kicker">PROJECTED READINESS</span><div><b>{score}</b><Icon name="arrow"/><strong>93</strong></div><p>Complete your top three recommended actions to gain a projected <b>+21 points.</b></p><div className="mini-trend"><i/><i/><i/><i/><i/></div></div><div className="resource-matrix"><span className="kicker">RESOURCE COMPLETENESS</span>{[["Safety",67],["Supplies",75],["Power",50],["Tools",50],["Information",40]].map(([n,v])=><div key={n}><span>{n}</span><div className="progress"><i style={{width:`${v}%`}}/></div><b>{v}%</b></div>)}</div><div className="exposure-card"><span className="kicker">LOCAL RISK EXPOSURE</span><div className="exposure-map"><i/><span>HOME</span><b>MODERATE</b></div><small>No active evacuation order · San Diego County</small></div></div>
+    <section className="report-doc"><div className="report-cover"><div className="brand"><div className="brand-mark"><Icon name="flame"/></div><b>ReadyCA</b></div><span>HOUSEHOLD READINESS</span><div className="report-score">{score}<small>/ 100</small></div><Badge>GOOD PREPAREDNESS</Badge><p>Prepared for {household}<br/>{locationLong(profile)}</p></div>
+    <div className="report-body"><h2>Executive Summary</h2><p>{summary}</p><div className="report-cols"><div><span className="kicker">STRENGTHS</span>{strengths.map(x=><p key={x}><Icon name="check" size={16}/>{x}</p>)}</div><div><span className="kicker">PRIORITY GAPS</span>{priorityGaps.length?priorityGaps.map(x=><p key={x}><i/> {x}</p>):<p><Icon name="check" size={16}/>No open gaps</p>}</div></div>
+    <h2>Household Readiness Analytics</h2><div className="report-analytics"><div className="radar-card"><svg viewBox="0 0 180 160"><g className="radar-grid"><polygon points="90,12 160,55 135,140 45,140 20,55"/><polygon points="90,36 137,65 120,120 60,120 43,65"/><line x1="90" y1="12" x2="90" y2="82"/><line x1="160" y1="55" x2="90" y2="82"/><line x1="135" y1="140" x2="90" y2="82"/><line x1="45" y1="140" x2="90" y2="82"/><line x1="20" y1="55" x2="90" y2="82"/></g><polygon className="radar-value" points="90,27 147,60 126,126 65,112 38,62"/><g className="radar-points">{[[90,27],[147,60],[126,126],[65,112],[38,62]].map(([x,y])=><circle cx={x} cy={y} r="3" key={x}/>)}</g></svg><div className="radar-labels"><span>Evacuation</span><span>Transport</span><span>Supplies</span><span>Pets</span><span>Communication</span></div></div><div className="projection-card"><span className="kicker">PROJECTED READINESS</span><div><b>{score}</b><Icon name="arrow"/><strong>93</strong></div><p>Complete your top three recommended actions to gain a projected <b>+21 points.</b></p><div className="mini-trend"><i/><i/><i/><i/><i/></div></div><div className="resource-matrix"><span className="kicker">RESOURCE COMPLETENESS</span>{RESOURCE_CATALOG.map(c=>[c.name.split(" ")[0],Math.round(c.items.filter(i=>profile.resources[i.name]?.status==="ready").length/c.items.length*100)] as [string,number]).map(([n,v])=><div key={n}><span>{n}</span><div className="progress"><i style={{width:`${v}%`}}/></div><b>{v}%</b></div>)}</div><div className="exposure-card"><span className="kicker">LOCAL RISK EXPOSURE</span><div className="exposure-map"><i/><span>HOME</span><b>MODERATE</b></div><small>No active evacuation order · {county}</small></div></div>
     <h2>Top 3 actions for fastest improvement</h2><div className="top-actions">{recommendations.slice(0,3).map((r,i)=><span key={r.title}><i>{i+1}</i>{r.title}<b>+{r.points}</b></span>)}</div><h2>Recommended Action Plan</h2>{recommendations.map((r,i)=><div className="action-line" key={r.title}><span>{i+1}</span><div><b>{r.title}</b><small>{r.level} · {r.time} · Supporting source: {r.source}</small></div><strong>+{r.points} pts</strong></div>)}</div></section>
   </div>;
 }
@@ -569,7 +860,40 @@ function PreparednessPlan({complete,completeTask}:{complete:string[];completeTas
   return <div><PageTitle kicker="YOUR ACTION PLAN" title="Preparedness Plan" copy="A prioritized checklist built from your household needs and readiness gaps."/><div className="plan-list">{recommendations.map((r,i)=><div className={`card plan-row ${complete.includes(r.title)?"is-done":""}`} key={r.title}><span className="plan-number">{complete.includes(r.title)?<Icon name="check"/>:i+1}</span><div><Badge tone={i===0?"orange":"blue"}>{r.level.toUpperCase()}</Badge><h3>{r.title}</h3><p>{r.why}</p><div className="source"><Icon name="shield" size={14}/> {r.source} · {r.time}</div></div><strong>+{r.points} pts</strong><Button disabled={complete.includes(r.title)} onClick={()=>completeTask(r.title,r.points)}>{complete.includes(r.title)?"Completed":"Complete task"}</Button></div>)}</div></div>;
 }
 
-function Settings(){return <div><PageTitle kicker="ACCOUNT & PREFERENCES" title="Settings" copy="Manage your preparedness location, alerts, privacy, and household access."/><section className="card settings-card">{["Preparedness location","Emergency notifications","Household members","Data & privacy","Accessibility"].map((x,i)=><button key={x}><span className="settings-icon"><Icon name={(["pin","bell","users","shield","help"] as IconName[])[i]}/></span><div><b>{x}</b><small>{i===0?"San Diego County, California":i===1?"Critical and action alerts enabled":"Review and manage"}</small></div><Icon name="chevron"/></button>)}</section></div>}
+function AccountSettings({onSignIn}:{onSignIn:()=>void}) {
+  const user = useCurrentUser();
+  const [name,setName]=useState(user.name===FALLBACK_NAME?"":user.name);
+  const [status,setStatus]=useState<{tone:"error"|"info";text:string}|null>(null);
+  const [saving,setSaving]=useState(false);
+  // Pick up the new value when the name changes (here or in another tab); only clear
+  // the status message when a different account signs in, so "Name updated." stays visible.
+  useEffect(()=>{setName(user.name===FALLBACK_NAME?"":user.name)},[user.name]);
+  useEffect(()=>{setStatus(null)},[user.email]);
+  if(!user.signedIn)return <section className="card account-card"><div className="avatar">{user.initials}</div><div><b>You're browsing as a guest</b><small>Sign in to save your plan and personalize ReadyCA with your name.</small></div><Button onClick={onSignIn}>Sign in</Button></section>;
+  const save=async()=>{
+    const trimmed=name.trim().replace(/\s+/g," ");
+    if(!trimmed||!supabase)return;
+    setSaving(true);setStatus(null);
+    // Updating user metadata triggers onAuthStateChange, which refreshes the name app-wide.
+    const {error}=await supabase.auth.updateUser({data:{full_name:trimmed}});
+    setSaving(false);
+    setStatus(error?{tone:"error",text:error.message}:{tone:"info",text:"Name updated."});
+  };
+  return <form className="card account-card" onSubmit={e=>{e.preventDefault();save()}}><div className="avatar">{user.initials}</div><div className="account-fields"><label>Display name<input value={name} maxLength={60} required placeholder="Your name" onChange={e=>setName(e.target.value)}/></label><small>{user.email}</small>{status&&<span className={`auth-message ${status.tone}`}>{status.text}</span>}</div><button className="btn btn-primary" type="submit" disabled={saving||!name.trim()||name.trim()===user.name}><span>{saving?"Saving…":"Save"}</span></button></form>;
+}
+
+function Settings({onSignIn,go}:{onSignIn:()=>void;go:(n:string)=>void}){
+  const { profile } = useHousehold();
+  const rows:[string,IconName,string,(()=>void)|undefined][]=[
+    ["Emergency notifications","bell","Critical and action alerts enabled",undefined],
+    ["Household members",  "users",`${plural(1+profile.members.length,"person")} · ${plural(profile.pets.length,"pet")} · ${plural(profile.vehicles.length,"vehicle")}`,()=>go("My Household")],
+    ["Data & privacy","shield","Review and manage",undefined],
+    ["Accessibility","help","Review and manage",undefined],
+  ];
+  return <div><PageTitle kicker="ACCOUNT & PREFERENCES" title="Settings" copy="Manage your account, preparedness location, alerts, privacy, and household access."/><AccountSettings onSignIn={onSignIn}/>
+    <section className="card location-card"><span className="settings-icon"><Icon name="pin"/></span><div><b>Preparedness location</b><small>{locationLong(profile)}</small><LocationForm/></div></section>
+    <section className="card settings-card">{rows.map(([label,icon,detail,onClick])=><button key={label} onClick={onClick}><span className="settings-icon"><Icon name={icon}/></span><div><b>{label}</b><small>{detail}</small></div><Icon name="chevron"/></button>)}</section></div>;
+}
 
 function NotificationPanel({onClose}:{onClose:()=>void}) {
   return <div className="notification-panel"><div className="panel-head"><div><b>Notifications</b><span>3 new updates</span></div><button onClick={onClose}><Icon name="close"/></button></div>{[
