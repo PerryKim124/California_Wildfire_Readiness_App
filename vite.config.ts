@@ -1,15 +1,18 @@
-import { defineConfig, type HtmlTagDescriptor, type Plugin } from 'vite'
+import { defineConfig, loadEnv, type Connect, type HtmlTagDescriptor, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
 
 import siteConfiguration from './.figma/make/site.json'
+import { FirmsError, fetchCaliforniaFires } from './supabase/functions/_shared/firms.ts'
 
 
 // Vite config — https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
   // .figma/make/deploy-preview passes `--mode development` for cached-preview builds.
   const emitSourcemaps = mode === 'development'
+  // Server-only secret: read here and never exposed through `define` or a VITE_ prefix.
+  const firmsMapKey = loadEnv(mode, process.cwd(), '').FIRMS_MAP_KEY
 
   return {
     base: process.env.FIGMA_PUBLIC_URL ? `${process.env.FIGMA_PUBLIC_URL}/` : '/',
@@ -21,6 +24,7 @@ export default defineConfig(({ mode }) => {
 react(),
       tailwindcss(),
       figmaSiteConfiguration(siteConfiguration),
+      firmsApi(firmsMapKey),
       figmaErrorOverlayReplay(),
       figmaReactRefreshBoundaryFallback(),
       figmaMakeKitPlugin({ storiesGlob: '/src/**/*.stories.{ts,tsx,js,jsx}' }),
@@ -46,6 +50,45 @@ react(),
     },
   }
 })
+
+/**
+ * Serves NASA FIRMS fire detections for California at /api/firms/california
+ * from the dev and preview servers, so the FIRMS MAP_KEY stays server-side.
+ */
+function firmsApi(mapKey: string | undefined): Plugin {
+  const handler: Connect.NextHandleFunction = (req, res, next) => {
+    const pathname = req.url?.split('?')[0] ?? ''
+    if (!pathname.endsWith('/api/firms/california')) return next()
+
+    const send = (status: number, body: unknown) => {
+      res.statusCode = status
+      res.setHeader('Content-Type', 'application/json; charset=utf-8')
+      res.setHeader('Cache-Control', 'no-store')
+      res.end(JSON.stringify(body))
+    }
+    if (req.method !== 'GET') return send(405, { error: 'Method not allowed.' })
+
+    fetchCaliforniaFires(mapKey).then(
+      (data) => send(200, data),
+      (error) => {
+        const status = error instanceof FirmsError ? error.status : 500
+        const message = error instanceof FirmsError ? error.message : 'Unexpected error while loading fire data.'
+        console.error(`[firms] ${message}`)
+        send(status, { error: message })
+      },
+    )
+  }
+
+  return {
+    name: 'firms-api',
+    configureServer(server) {
+      server.middlewares.use(handler)
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use(handler)
+    },
+  }
+}
 
 type FigmaSiteConfiguration = {
   title?: string

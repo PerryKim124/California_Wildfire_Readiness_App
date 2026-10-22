@@ -13,6 +13,12 @@ export type ContactKind = "Emergency contact" | "Out-of-area contact" | "School 
 export type Contact = { id: string; name: string; kind: ContactKind; detail: string };
 export type ResourceStatus = "ready" | "attention" | "missing";
 export type ResourceState = { status: ResourceStatus; quantity: string; location: string; updatedAt: string | null };
+/** A place picked on the evacuation map. */
+export type MapPlace = { label: string; lat: number; lng: number };
+/** A planned route, saved so the dashboard can show it without re-routing. `line` is simplified [lat, lng] points. */
+export type SavedRoute = { miles: number; minutes: number; roads: string[]; line: [number, number][] };
+/** The evacuation map: where the household starts, where it goes, and the routes saved with the plan. */
+export type EvacuationMap = { home: MapPlace | null; destination: MapPlace | null; primary: SavedRoute | null; backup: SavedRoute | null };
 
 export type HouseholdProfile = {
   version: 1;
@@ -26,6 +32,7 @@ export type HouseholdProfile = {
   meetingPoint: string;
   resources: Record<string, ResourceState>;
   evacuationPlanSaved: boolean;
+  evacuation: EvacuationMap;
 };
 
 export const OWNER_ID = "owner";
@@ -89,6 +96,7 @@ export function emptyProfile(): HouseholdProfile {
     members: [], roles: {}, pets: [], vehicles: [], contacts: [], meetingPoint: "",
     resources: Object.fromEntries(ALL_RESOURCES.map((r) => [r.name, missing()])),
     evacuationPlanSaved: false,
+    evacuation: { home: null, destination: null, primary: null, backup: null },
   };
 }
 
@@ -119,6 +127,8 @@ export function demoProfile(): HouseholdProfile {
       { id: "c3", name: "The Garcias", kind: "Neighbor", detail: "Mutual support" },
     ],
     meetingPoint: "Poway Library parking lot",
+    // Demo trip: central Poway to the Del Mar Fairgrounds, a regular San Diego County evacuation site.
+    evacuation: { home: { label: "Poway, San Diego County, California", lat: 32.9628, lng: -117.0359 }, destination: { label: "Del Mar Fairgrounds, Del Mar, San Diego County", lat: 32.9758, lng: -117.2617 }, primary: null, backup: null },
     resources: {
       ...p.resources,
       "Fire extinguisher": ready("1", "Garage cabinet"), "Smoke alarms": ready("4", "Throughout home"), "Carbon monoxide detector": ready("2", "Hallways"),
@@ -148,6 +158,7 @@ export function normalizeProfile(raw: unknown): HouseholdProfile {
     meetingPoint: typeof r.meetingPoint === "string" ? r.meetingPoint : "",
     resources: { ...base.resources, ...(r.resources ?? {}) },
     evacuationPlanSaved: Boolean(r.evacuationPlanSaved),
+    evacuation: { ...base.evacuation, ...(r.evacuation && typeof r.evacuation === "object" ? r.evacuation : {}) },
   };
 }
 

@@ -5,12 +5,19 @@ import { CurrentUserContext, FALLBACK_NAME, possessive, useCurrentUser, userFrom
 import {
   ALL_RESOURCES, CA_COUNTIES, CONTACT_KINDS, HouseholdContext, MEMBER_TYPES, OWNER_ID, PET_CHECKS, PET_SPECIES, RESOURCE_CATALOG, ROLES, VEHICLE_POWER,
   analyzeHousehold, countyLabel, demoProfile, emptyProfile, initials, loadHousehold, locationLong, locationShort, memberLabel, newId, newPet, petScore, plural, saveHousehold, useHousehold,
-  type Contact, type ContactKind, type HouseholdProfile, type Member, type MemberType, type Pet, type ResourceStatus, type SaveState, type Vehicle,
+  type Contact, type ContactKind, type HouseholdProfile, type MapPlace, type Member, type MemberType, type Pet, type ResourceStatus, type SaveState, type SavedRoute, type Vehicle,
 } from "./lib/household";
 import { ADVISOR_QUESTIONS, QUESTION_BY_ID, matchQuestion, type AdvisorAnswer, type AdvisorQuestion } from "./lib/advisor";
 import { ALERTS, EVACUATION_STEPS, MYTHS, SCENARIOS, bagItems, shuffle } from "./lib/games";
 import logo from "./assets/CAReady128x.png";
 import Auth from "./Auth";
+import FireMap from "./FireMap";
+import FireHistoryPanel from "./FireHistory";
+import EvacuationMap, { type PickTarget } from "./EvacuationMap";
+import LocalFireMap from "./LocalFireMap";
+import MapBoundary from "./MapBoundary";
+import { getCaliforniaFires, type FireDetection } from "./lib/firms";
+import { describePoint, directionTo, directionsUrl, milesBetween, nearestFireToLine, planRoutes, searchPlaces, simplifyLine, toMiles, type Route, type RoutePlan } from "./lib/geo";
 import "./enhancements.css";
 
 type IconName =
@@ -259,7 +266,7 @@ function App() {
         {active === "Dashboard" && <Dashboard score={score} complete={complete} openScore={() => setScoreOpen(true)} completeTask={completeTask} go={go}/>}
         {active === "My Household" && <Household onSignIn={() => openAuth("signin")}/>}
         {active === "Wildfire Risk" && <RiskMap go={go}/>}
-        {active === "Evacuation" && <Evacuation go={go}/>}
+        {active === "Evacuation" && <Evacuation/>}
         {active === "AI Readiness Advisor" && <Advisor score={score}/>}
         {active === "Emergency Decision Game" && <DecisionGame/>}
         {active === "Progress" && <Progress score={score} complete={complete}/>}
@@ -366,12 +373,7 @@ function Dashboard({ score, complete, openScore, completeTask, go }: { score: nu
     <div className="recommendation-grid">{recommendations.slice(0, 3).map((r, i) => <Recommendation key={r.title} item={r} index={i} done={complete.includes(r.title)} onComplete={() => completeTask(r.title, r.points)}/>)}</div>
 
     <div className="lower-grid">
-      <section className="card local-card">
-        <div className="card-heading"><div><span className="kicker">AROUND YOUR LOCATION</span><h2>Local wildfire overview</h2></div><span className="updated">Updated 8 min ago</span></div>
-        <MiniMap/>
-        <div className="map-stats"><div><span>Nearest active fire</span><b>Border 2 Fire</b></div><div><span>Distance</span><b>42 miles SE</b></div><div><span>Evacuation zone</span><b className="safe-text">Clear</b></div></div>
-        <Button variant="secondary" onClick={() => go("Wildfire Risk")}>Open interactive risk map</Button>
-      </section>
+      <LocalOverview go={go}/>
       <section className="card progress-card">
         <div className="card-heading"><div><span className="kicker">{now.toLocaleDateString("en-US", { month: "long" }).toUpperCase()} GOAL</span><h2>Build your evacuation plan</h2></div><b>3 / 5</b></div>
         <div className="progress"><i style={{width:"60%"}}/></div>
@@ -384,18 +386,6 @@ function Dashboard({ score, complete, openScore, completeTask, go }: { score: nu
 
 function Recommendation({ item, index, done, onComplete }: { item: typeof recommendations[number]; index: number; done: boolean; onComplete: () => void }) {
   return <article className={`card rec-card ${done ? "is-done" : ""}`}><div className={`rec-icon rec-${index}`}><Icon name={index === 0 ? "route" : index === 1 ? "box" : "phone"}/></div><span className="point-label">+{item.points} POINTS</span><h3>{item.title}</h3><p>{item.why}</p><div className="meta"><span><Icon name="clock" size={14}/>{item.time}</span><span>{item.level}</span></div><div className="source"><Icon name="shield" size={14}/> Verified · {item.source}</div><Button variant={done ? "secondary" : "primary"} onClick={onComplete} disabled={done}>{done ? <><Icon name="check"/> Completed</> : "Complete this task"}</Button></article>;
-}
-
-function MiniMap({ interactive = false }: { interactive?: boolean }) {
-  const [selected, setSelected] = useState<string | null>(null);
-  return <div className={`map ${interactive ? "map-large" : ""}`}>
-    <div className="terrain t1"/><div className="terrain t2"/><div className="road r1"/><div className="road r2"/><div className="road r3"/>
-    <span className="map-label la">ESCONDIDO</span><span className="map-label lb">SAN DIEGO</span><span className="map-label lc">CHULA VISTA</span><span className="ocean">PACIFIC OCEAN</span>
-    <button className="map-pin user-pin" onClick={() => setSelected("Your selected location")}><span/><i/></button>
-    <button className="map-pin fire-pin" onClick={() => setSelected("Border 2 Fire · 18% contained")}><Icon name="flame" size={13}/></button>
-    {interactive && <><button className="map-pin shelter-pin" onClick={() => setSelected("Canyon Hills Shelter · Open")}><Icon name="home" size={13}/></button><div className="fire-area"/></>}
-    {selected && <div className="map-pop"><b>{selected}</b><span>Updated 8 minutes ago</span><button onClick={()=>setSelected(null)}><Icon name="close" size={13}/></button></div>}
-  </div>;
 }
 
 function ScoreModal({ score, complete, close, completeTask }: { score: number; complete: string[]; close: () => void; completeTask: (t:string,p:number)=>void }) {
@@ -413,33 +403,278 @@ function ScoreModal({ score, complete, close, completeTask }: { score: number; c
 
 // Incident, route, and shelter details on these pages are San Diego County examples
 // until a live data source is connected; say so when the household lives elsewhere.
-function SampleDataNote({ go }: { go:(n:string)=>void }) {
+function SampleDataNote({ go, examples = "The map, incidents, and shelters below are" }: { go:(n:string)=>void; examples?: string }) {
   const { profile } = useHousehold();
   if (profile.location.county === "San Diego") return null;
-  return <div className="sample-note"><Icon name="help"/><span>{profile.location.county?`Live incident and route data for ${countyLabel(profile)} isn't connected yet. The map, incidents, and shelters below are San Diego County examples.`:"Set your location to personalize this page. The map, incidents, and shelters below are San Diego County examples."}</span><button className="text-button" onClick={()=>go("Settings")}>{profile.location.county?"Change location":"Set location"}</button></div>;
+  return <div className="sample-note"><Icon name="help"/><span>{profile.location.county?`Live incident and route data for ${countyLabel(profile)} isn't connected yet. ${examples} San Diego County examples.`:`Set your location to personalize this page. ${examples} San Diego County examples.`}</span><button className="text-button" onClick={()=>go("Settings")}>{profile.location.county?"Change location":"Set location"}</button></div>;
 }
 
 function RiskMap({ go }: { go:(n:string)=>void }) {
-  const [layer,setLayer]=useState("Risk");
   return <div><PageTitle kicker="LIVE SITUATIONAL AWARENESS" title="Wildfire Risk" copy="Monitor local incidents, evacuation zones, shelters, and road conditions."/>
-    <SampleDataNote go={go}/>
-    <div className="map-layout"><section className="card map-panel"><div className="map-controls">{["Risk","Active Fires","Evacuation Zones","Shelters","Roads"].map(x=><button className={layer===x?"active":""} onClick={()=>setLayer(x)} key={x}>{x}</button>)}</div><MiniMap interactive/><div className="map-disclaimer"><Icon name="shield"/> Emergency information can change rapidly. Always follow official evacuation orders and instructions from local authorities.</div></section>
+    <SampleDataNote go={go} examples="The fire map shows live NASA satellite detections; the incident and shelter details beside it are"/>
+    <div className="map-layout"><section className="card map-panel"><FireMap/><div className="map-disclaimer"><Icon name="shield"/> Emergency information can change rapidly. Always follow official evacuation orders and instructions from local authorities.</div></section>
     <aside className="card risk-side"><span className="kicker">CURRENT LOCAL RISK</span><div className="risk-level"><span>MODERATE</span><i>3</i></div><p>No active evacuation order detected near your selected location.</p><hr/><Info label="Nearest active wildfire" value="Border 2 Fire"/><Info label="Distance" value="42 miles southeast"/><Info label="Fire status" value="18% contained"/><Info label="Last updated" value="8 minutes ago"/><Info label="Evacuation zone" value="No current order"/><Info label="Nearby shelter" value="Canyon Hills · Open"/><Button onClick={()=>go("Evacuation")}>Plan evacuation route <Icon name="arrow"/></Button><div className="verified"><Icon name="shield"/> Verified incident sources</div></aside></div>
+    <FireHistoryPanel/>
   </div>;
 }
 
-function Evacuation({ go }: { go:(n:string)=>void }) {
-  const { profile, update } = useHousehold();
-  const [route,setRoute]=useState("Primary");
-  const saved=profile.evacuationPlanSaved;
-  return <div><PageTitle kicker="HOUSEHOLD PLAN" title="Your Evacuation Plan" copy="Review two ways out and keep a destination ready before conditions change."/>
-    <SampleDataNote go={go}/>
-    <div className="route-tabs"><button className={route==="Primary"?"active":""} onClick={()=>setRoute("Primary")}>Primary Evacuation Route</button><button className={route==="Backup"?"active":""} onClick={()=>setRoute("Backup")}>Backup Evacuation Route</button></div>
-    <div className="map-layout"><section className="card route-map"><MiniMap interactive/><div className={`route-overlay ${route==="Backup"?"backup":""}`}><i/><i/><i/><i/></div></section>
-    <aside className="card risk-side"><Badge tone={route==="Primary"?"green":"blue"}>{route.toUpperCase()} ROUTE</Badge><h2>Home → {route==="Primary"?"Canyon Hills Shelter":"Poway Community Center"}</h2><div className="route-metrics"><div><b>{route==="Primary"?"24":"31"} min</b><span>Estimated time</span></div><div><b>{route==="Primary"?"13.2":"18.7"} mi</b><span>Distance</span></div></div><Info label="Major roads" value={route==="Primary"?"I-15 N → CA-56":"Scripps Poway Pkwy"}/><Info label="Potential hazards" value={route==="Primary"?"1 narrow segment":"Heavy school traffic"}/><Info label="Household meeting point" value={profile.meetingPoint||"Not set"}/><Info label="Evacuating" value={`${plural(1+profile.members.length,"person")} · ${plural(profile.pets.length,"pet")}`}/><div className="button-stack"><Button onClick={()=>update(p=>({...p,evacuationPlanSaved:!p.evacuationPlanSaved}))}>{saved?<><Icon name="check"/> Plan saved</>:"Save Evacuation Plan"}</Button><Button variant="secondary">Practice This Route</Button></div></aside></div>
-    <section className="section-head"><div><span className="kicker">SAFE DESTINATIONS</span><h2>Nearby emergency shelters</h2></div></section>
-    <div className="shelters">{["Canyon Hills Recreation Center","Poway Community Center","Mira Mesa Senior Center"].map((x,i)=><div className="card shelter" key={x}><div className="shelter-icon"><Icon name="home"/></div><div><h3>{x}</h3><p>{[4.8,7.2,9.1][i]} miles · <span className="safe-text">Open</span></p><span className="amenity">Pet-friendly</span><span className="amenity">Accessible</span></div><Icon name="chevron"/></div>)}</div>
+// ---- evacuation planning -------------------------------------------------------
+
+/** "24 min" or "1 hr 5 min". */
+function formatDuration(seconds: number) {
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} hr${minutes % 60 ? ` ${minutes % 60} min` : ""}`;
+}
+
+/** "just now", "12 min ago", "3 hrs ago". */
+function timeAgo(iso: string) {
+  const minutes = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 60_000));
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} hr${hours === 1 ? "" : "s"} ago`;
+}
+
+/** Shrinks a planned route to what the household profile stores (and the dashboard draws). */
+const toSavedRoute = (r: Route): SavedRoute => ({ miles: +toMiles(r.meters).toFixed(1), minutes: Math.round(r.seconds / 60), roads: r.roads, line: simplifyLine(r.coords) });
+
+// Where the household's home is on the map: the exact pin from the Evacuation page if set,
+// otherwise the center of their city (or county) from address search, marked approximate.
+function useHomePlace(profile: HouseholdProfile, ignoreExact = false): { place: MapPlace | null; approximate: boolean; loading: boolean } {
+  const exact = ignoreExact ? null : profile.evacuation.home;
+  const { city, county } = profile.location;
+  const query = county ? `${city ? `${city}, ` : ""}${county} County, California` : "";
+  const [found, setFound] = useState<{ query: string; place: MapPlace | null } | null>(null);
+  useEffect(() => {
+    if (exact || !query) return;
+    const controller = new AbortController();
+    searchPlaces(query, controller.signal).then((results) => setFound({ query, place: results[0] ?? null }), () => { if (!controller.signal.aborted) setFound({ query, place: null }); });
+    return () => controller.abort();
+  }, [exact, query]);
+  if (exact) return { place: exact, approximate: false, loading: false };
+  if (!query) return { place: null, approximate: false, loading: false };
+  const current = found?.query === query ? found : null;
+  return { place: current?.place ?? null, approximate: true, loading: !current };
+}
+
+// Live NASA FIRMS detections for California, shared between the dashboard and evacuation map.
+function useFires() {
+  const [state, setState] = useState<{ fires: FireDetection[]; retrievedAt: string | null; error: string | null; loading: boolean }>({ fires: [], retrievedAt: null, error: null, loading: true });
+  useEffect(() => {
+    let cancelled = false;
+    getCaliforniaFires().then(
+      (r) => { if (!cancelled) setState({ fires: r.detections, retrievedAt: r.retrievedAt, error: null, loading: false }); },
+      (e: unknown) => { if (!cancelled) setState({ fires: [], retrievedAt: null, error: e instanceof Error ? e.message : "Fire data is unavailable.", loading: false }); },
+    );
+    return () => { cancelled = true; };
+  }, []);
+  return state;
+}
+
+// One place (home or destination). Searches run only when submitted, per the address
+// service's usage policy; matches appear as a short list to choose from.
+function PlaceSearch({ label, hint, place, onChange, picking, onPickOnMap, children }: { label: string; hint: string; place: MapPlace | null; onChange: (p: MapPlace) => void; picking: boolean; onPickOnMap: () => void; children?: ReactNode }) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<MapPlace[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const id = label.toLowerCase().replace(/\W+/g, "-");
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!query.trim()) return;
+    setBusy(true); setError(null); setResults(null);
+    try {
+      const found = await searchPlaces(query);
+      if (found.length) setResults(found); else setError("No matches in California. Try adding a city or ZIP code.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Address search failed.");
+    } finally { setBusy(false); }
+  };
+  const choose = (p: MapPlace) => { onChange(p); setResults(null); setQuery(""); };
+  return <div className="place-search">
+    <div className="place-search-head"><label htmlFor={id}>{label}</label><span className={place ? "place-current" : "place-current unset"} title={place?.label}>{place ? place.label : "Not set"}</span></div>
+    <form onSubmit={submit} className="place-search-form">
+      <input id={id} value={query} onChange={(e) => setQuery(e.target.value)} placeholder={hint} autoComplete="off"/>
+      <button className="btn btn-secondary" disabled={busy || !query.trim()}>{busy ? "Searching…" : "Search"}</button>
+    </form>
+    <div className="place-search-actions">
+      <button type="button" className={`text-button ${picking ? "is-active" : ""}`} onClick={onPickOnMap} aria-pressed={picking}><Icon name="pin" size={14}/> {picking ? "Cancel map pick" : "Pick on map"}</button>
+      {children}
+    </div>
+    {error && <p className="place-search-error" role="alert">{error}</p>}
+    {results && <ul className="place-results" aria-label={`${label} matches`}>{results.map((r) => <li key={`${r.lat},${r.lng}`}><button type="button" onClick={() => choose(r)}><Icon name="pin" size={14}/>{r.label}</button></li>)}</ul>}
   </div>;
+}
+
+// How close the selected route comes to a satellite fire detection. MODIS pixels are about
+// 1 km across and detections are up to 24 hours old, so this is a warning sign to check
+// official sources, not a statement that a road is open or closed.
+function RouteFireCheck({ route, fires, firesError }: { route: Route; fires: FireDetection[]; firesError: string | null }) {
+  if (firesError) return <div className="route-check unknown"><Icon name="help"/><span>Fire detections are unavailable, so this route couldn't be checked.</span></div>;
+  const nearest = nearestFireToLine(route.coords, fires);
+  if (!nearest) return <div className="route-check clear"><Icon name="shield"/><span><b>No satellite fire detections</b> in California in the last 24 hours.</span></div>;
+  const miles = nearest.miles < 10 ? nearest.miles.toFixed(1) : Math.round(nearest.miles).toLocaleString();
+  const near = nearest.fire.nearest ? ` near ${nearest.fire.nearest.name}` : "";
+  if (nearest.miles < 5) return <div className="route-check danger" role="alert"><Icon name="flame"/><span><b>Fire detected {miles} mi from this route</b>{near}. Check official evacuation orders and road closures before using it.</span></div>;
+  if (nearest.miles < 15) return <div className="route-check caution"><Icon name="flame"/><span><b>Fire detected {miles} mi from this route</b>{near}. Keep an eye on official updates.</span></div>;
+  return <div className="route-check clear"><Icon name="shield"/><span><b>Nearest fire detection is {miles} mi away</b>{near}.</span></div>;
+}
+
+function Evacuation() {
+  const { profile, update } = useHousehold();
+  const { home, destination } = profile.evacuation;
+  const cityCenter = useHomePlace(profile, true); // where to center the map before a home is set
+  const { fires, error: firesError, retrievedAt } = useFires();
+  const [active, setActive] = useState<"primary" | "backup">("primary");
+  const [plan, setPlan] = useState<RoutePlan | null>(null);
+  const [planning, setPlanning] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const [pickMode, setPickMode] = useState<PickTarget | null>(null);
+  const [locating, setLocating] = useState(false);
+  const [locateError, setLocateError] = useState<string | null>(null);
+  const saved = profile.evacuationPlanSaved;
+  // Keep the map's fallback center stable between renders so it doesn't re-frame needlessly.
+  const fallbackCenter = useMemo<[number, number] | null>(() => (cityCenter.place ? [cityCenter.place.lat, cityCenter.place.lng] : null), [cityCenter.place?.lat, cityCenter.place?.lng]);
+
+  // Re-plan whenever both places are set and either one moves. Keyed on coordinates, not
+  // object identity, so reloading the same profile doesn't trigger new routing requests.
+  useEffect(() => {
+    if (!home || !destination) { setPlan(null); setPlanError(null); return; }
+    const controller = new AbortController();
+    // Drop the old routes right away so the sidebar never shows them under the new place names.
+    setPlan(null); setPlanning(true); setPlanError(null);
+    planRoutes(home, destination, controller.signal).then(
+      (p) => { setPlan(p); if (!p.backup) setActive("primary"); },
+      (e: unknown) => { if (!controller.signal.aborted) { setPlan(null); setPlanError(e instanceof Error ? e.message : "Couldn't plan a route."); } },
+    ).finally(() => { if (!controller.signal.aborted) setPlanning(false); });
+    return () => controller.abort();
+  }, [home?.lat, home?.lng, destination?.lat, destination?.lng]);
+
+  // Changing either place invalidates the saved routes, so the plan needs saving again.
+  const setPlace = (target: PickTarget, place: MapPlace) => update((p) => {
+    const old = p.evacuation[target];
+    const moved = !old || old.lat !== place.lat || old.lng !== place.lng;
+    return { ...p, evacuationPlanSaved: moved ? false : p.evacuationPlanSaved, evacuation: { ...p.evacuation, [target]: place, ...(moved ? { primary: null, backup: null } : {}) } };
+  });
+
+  // A clicked, dragged, or device-located point is placed right away with its coordinates,
+  // then relabeled with the nearest address once the lookup returns.
+  const placePoint = (target: PickTarget, lat: number, lng: number) => {
+    setPickMode(null);
+    const point = { lat: +lat.toFixed(6), lng: +lng.toFixed(6) };
+    setPlace(target, { label: `Dropped pin (${point.lat.toFixed(4)}, ${point.lng.toFixed(4)})`, ...point });
+    describePoint(point.lat, point.lng).then((label) => update((p) => {
+      const current = p.evacuation[target];
+      return current && current.lat === point.lat && current.lng === point.lng ? { ...p, evacuation: { ...p.evacuation, [target]: { ...current, label } } } : p;
+    }));
+  };
+
+  const useMyLocation = () => {
+    if (!navigator.geolocation) { setLocateError("This browser can't share its location."); return; }
+    setLocating(true); setLocateError(null);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => { setLocating(false); placePoint("home", pos.coords.latitude, pos.coords.longitude); },
+      (err) => { setLocating(false); setLocateError(err.code === err.PERMISSION_DENIED ? "Location permission was denied. Search for your address instead." : "Couldn't get your location. Search for your address instead."); },
+      { enableHighAccuracy: true, timeout: 15_000 },
+    );
+  };
+
+  const route = active === "backup" ? plan?.backup ?? null : plan?.primary ?? null;
+  // Saving stores the routes with the plan so the dashboard can show them; clicking again un-saves.
+  const savePlan = () => update((p) => saved
+    ? { ...p, evacuationPlanSaved: false }
+    : { ...p, evacuationPlanSaved: true, evacuation: { ...p.evacuation, primary: plan ? toSavedRoute(plan.primary) : null, backup: plan?.backup ? toSavedRoute(plan.backup) : null } });
+
+  return <div><PageTitle kicker="HOUSEHOLD PLAN" title="Your Evacuation Plan" copy="Set where you'll leave from and where you'll go. ReadyCA plans two ways out and checks them against live fire detections."/>
+
+    <section className="card evac-setup">
+      <PlaceSearch label="Home (start)" hint="Street address, city, or ZIP" place={home} onChange={(p) => setPlace("home", p)} picking={pickMode === "home"} onPickOnMap={() => setPickMode(pickMode === "home" ? null : "home")}>
+        <button type="button" className="text-button" onClick={useMyLocation} disabled={locating}><Icon name="route" size={14}/> {locating ? "Locating…" : "Use my location"}</button>
+      </PlaceSearch>
+      <PlaceSearch label="Destination" hint="A relative's home, hotel, or evacuation center" place={destination} onChange={(p) => setPlace("destination", p)} picking={pickMode === "destination"} onPickOnMap={() => setPickMode(pickMode === "destination" ? null : "destination")}/>
+      <p className="evac-setup-tip"><Icon name="help" size={14}/> Choose a destination outside your immediate area, ideally away from where fires usually come from. Officials may open specific evacuation centers during a fire; follow their instructions.</p>
+      {locateError && <p className="place-search-error" role="alert">{locateError}</p>}
+    </section>
+
+    <div className="route-tabs" role="tablist" aria-label="Evacuation routes">
+      <button role="tab" aria-selected={active === "primary"} className={active === "primary" ? "active" : ""} onClick={() => setActive("primary")}>Primary Evacuation Route</button>
+      <button role="tab" aria-selected={active === "backup"} className={active === "backup" ? "active" : ""} onClick={() => setActive("backup")} disabled={!plan?.backup}>Backup Evacuation Route</button>
+    </div>
+
+    <div className="map-layout">
+      <section className="card route-map">
+        <MapBoundary className="evac-map-frame"><EvacuationMap home={home} destination={destination} plan={plan} active={active} fires={fires} pickMode={pickMode} onPick={placePoint} fallbackCenter={fallbackCenter}/></MapBoundary>
+        {planning && <div className="evac-status" role="status">Planning routes…</div>}
+        <div className="map-disclaimer"><Icon name="shield"/> Routes come from OpenStreetMap road data and don't know about closures or traffic. Always follow official evacuation orders and directions from local authorities.</div>
+      </section>
+
+      <aside className="card risk-side evac-side">
+        {!home || !destination ? <>
+          <Badge tone="gray">NO ROUTE YET</Badge>
+          <h2>Set your home and destination</h2>
+          <p className="evac-empty">Search for an address, use your device's location, or pick points on the map. ReadyCA will plan a primary route and a backup that avoids it where roads allow.</p>
+        </> : planError ? <>
+          <Badge tone="orange">ROUTE UNAVAILABLE</Badge>
+          <h2>Couldn't plan this trip</h2>
+          <p className="evac-empty" role="alert">{planError}</p>
+        </> : !route ? <>
+          <Badge tone="gray">{planning ? "PLANNING" : "NO ROUTE"}</Badge>
+          <h2>{planning ? "Planning your routes…" : "No route found"}</h2>
+        </> : <>
+          <Badge tone={active === "primary" ? "green" : "blue"}>{active.toUpperCase()} ROUTE</Badge>
+          <h2>Home → {destination.label.split(",")[0]}</h2>
+          <div className="route-metrics"><div><b>{formatDuration(route.seconds)}</b><span>Estimated time (no traffic)</span></div><div><b>{toMiles(route.meters).toFixed(1)} mi</b><span>Distance</span></div></div>
+          <RouteFireCheck route={route} fires={fires} firesError={firesError}/>
+          <Info label="Main roads" value={route.roads.join(", ") || "Local streets"}/>
+          {active === "backup" && plan?.backupOverlap != null && <Info label="Shared with primary route" value={`${Math.round(plan.backupOverlap * 100)}% of roads`}/>}
+          {active === "primary" && !plan?.backup && <Info label="Backup route" value="None found that avoids this road"/>}
+          <Info label="Household meeting point" value={profile.meetingPoint||"Not set"}/>
+          <Info label="Evacuating" value={`${plural(1+profile.members.length,"person")} · ${plural(profile.pets.length,"pet")}`}/>
+          <div className="button-stack">
+            <Button onClick={savePlan} disabled={!plan}>{saved?<><Icon name="check"/> Plan saved</>:"Save Evacuation Plan"}</Button>
+            <a className="btn btn-secondary" href={directionsUrl(home, destination, route.via)} target="_blank" rel="noreferrer"><Icon name="external" size={16}/><span>Practice in Google Maps</span></a>
+          </div>
+          {retrievedAt && <p className="evac-fires-time">Fire detections from NASA FIRMS, retrieved {timeAgo(retrievedAt)}.</p>}
+        </>}
+      </aside>
+    </div>
+
+    <section className="section-head"><div><span className="kicker">DURING AN EVACUATION</span><h2>Find official shelters and orders</h2><p>Shelters open only during an emergency, and where they open depends on the fire. Check these official sources when an evacuation is ordered.</p></div></section>
+    <div className="shelters">{([
+      ["Find an open shelter", "American Red Cross shelter map, updated during disasters.", "https://www.redcross.org/get-help/disaster-relief-and-recovery-services/find-an-open-shelter.html", "home"],
+      ["Evacuation orders & zones", "Look up your evacuation zone and live orders on Genasys Protect, used by most California counties.", "https://protect.genasys.com/", "route"],
+      ["CAL FIRE Go! evacuation guide", "What to do when you're told to leave, and what to take.", "https://www.readyforwildfire.org/prepare-for-wildfire/go-evacuation-guide/", "book"],
+    ] as [string, string, string, IconName][]).map(([title, copy, href, icon]) => <a className="card shelter shelter-link" key={title} href={href} target="_blank" rel="noreferrer"><div className="shelter-icon"><Icon name={icon}/></div><div><h3>{title}</h3><p>{copy}</p></div><Icon name="external"/></a>)}</div>
+  </div>;
+}
+
+// Dashboard card: live fire detections around the household's home, the nearest one, and
+// the saved evacuation route. Uses the exact home pin when set, otherwise the city center.
+const NEARBY_MILES = 50;
+function LocalOverview({ go }: { go:(n:string)=>void }) {
+  const { profile } = useHousehold();
+  const home = useHomePlace(profile);
+  const { fires, retrievedAt, error, loading } = useFires();
+  const saved = profile.evacuationPlanSaved ? profile.evacuation.primary : null;
+  const at: [number, number] | null = home.place ? [home.place.lat, home.place.lng] : null;
+  // Distance from home to each detection, nearest first.
+  const ranked = at ? fires.map((f) => ({ f, miles: milesBetween(at, [f.latitude, f.longitude]) })).sort((a, b) => a.miles - b.miles) : [];
+  const nearest = ranked[0];
+  const nearby = ranked.filter((r) => r.miles <= NEARBY_MILES).length;
+  const pending = loading || (!at && home.loading);
+  return <section className="card local-card">
+    <div className="card-heading"><div><span className="kicker">AROUND YOUR LOCATION</span><h2>Local wildfire overview</h2></div><span className="updated">{retrievedAt ? `Updated ${timeAgo(retrievedAt)}` : loading ? "Loading…" : "Not available"}</span></div>
+    {home.place
+      ? <MapBoundary className="local-map"><LocalFireMap home={home.place} approximate={home.approximate} destination={saved ? profile.evacuation.destination : null} route={saved} fires={fires} radiusMiles={NEARBY_MILES}/></MapBoundary>
+      : <div className="local-map local-map-empty">{home.loading ? "Finding your location…" : <><b>Set your location to see nearby fires</b><Button variant="secondary" icon="pin" onClick={() => go("Settings")}>Set location</Button></>}</div>}
+    <div className="map-stats">
+      <div><span>Nearest fire detection</span><b className={nearest && nearest.miles <= NEARBY_MILES ? "warn-text" : ""}>{error ? "Unavailable" : pending || !at ? "—" : nearest ? `${Math.round(nearest.miles)} mi ${directionTo(at, [nearest.f.latitude, nearest.f.longitude])}` : "None in CA"}</b>{nearest?.f.nearest && <small>near {nearest.f.nearest.name}</small>}</div>
+      <div><span>Within {NEARBY_MILES} miles</span><b className={!at || error || pending ? "" : nearby ? "warn-text" : "safe-text"}>{error || pending || !at ? "—" : nearby ? plural(nearby, "detection") : "None"}</b><small>last 24 hours</small></div>
+      <div><span>Evacuation route</span>{saved ? <><b>{saved.miles} mi · {formatDuration(saved.minutes * 60)}</b><small>to {profile.evacuation.destination?.label.split(",")[0]}</small></> : <><b>Not saved</b><small><button className="link-button" onClick={() => go("Evacuation")}>Plan your route</button></small></>}</div>
+    </div>
+    {home.approximate && home.place && <p className="local-note">Centered on {profile.location.city || `${profile.location.county} County`}. <button className="link-button" onClick={() => go("Evacuation")}>Set your home address</button> for exact distances.</p>}
+    <Button variant="secondary" onClick={() => go("Wildfire Risk")}>Open interactive risk map</Button>
+  </section>;
 }
 
 // ---- household forms (used by the Household pages and by first-time setup) ----
