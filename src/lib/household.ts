@@ -163,7 +163,7 @@ export const initials = (name: string) => {
   const w = name.trim().split(/\s+/).filter(Boolean);
   return w.length === 0 ? "?" : w.length === 1 ? w[0].slice(0, 2).toUpperCase() : (w[0][0] + w[w.length - 1][0]).toUpperCase();
 };
-const IRREGULAR: Record<string, string> = { person: "people" };
+const IRREGULAR: Record<string, string> = { person: "people", child: "children" };
 export const plural = (n: number, word: string) => `${n} ${n === 1 ? word : IRREGULAR[word] ?? `${word}s`}`;
 
 // ---- analysis: every score shown on the Household pages comes from here --------

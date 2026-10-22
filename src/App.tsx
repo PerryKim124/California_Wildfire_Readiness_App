@@ -7,6 +7,8 @@ import {
   analyzeHousehold, countyLabel, demoProfile, emptyProfile, initials, loadHousehold, locationLong, locationShort, memberLabel, newId, newPet, petScore, plural, saveHousehold, useHousehold,
   type Contact, type ContactKind, type HouseholdProfile, type Member, type MemberType, type Pet, type ResourceStatus, type SaveState, type Vehicle,
 } from "./lib/household";
+import { ADVISOR_QUESTIONS, QUESTION_BY_ID, matchQuestion, type AdvisorAnswer, type AdvisorQuestion } from "./lib/advisor";
+import { ALERTS, EVACUATION_STEPS, MYTHS, SCENARIOS, bagItems, shuffle } from "./lib/games";
 import Auth from "./Auth";
 import "./enhancements.css";
 
@@ -252,7 +254,7 @@ function App() {
         {active === "My Household" && <Household onSignIn={() => openAuth("signin")}/>}
         {active === "Wildfire Risk" && <RiskMap go={go}/>}
         {active === "Evacuation" && <Evacuation go={go}/>}
-        {active === "AI Readiness Advisor" && <Advisor/>}
+        {active === "AI Readiness Advisor" && <Advisor score={score}/>}
         {active === "Emergency Decision Game" && <DecisionGame/>}
         {active === "Progress" && <Progress score={score} complete={complete}/>}
         {active === "Sources & Evidence" && <Evidence/>}
@@ -770,46 +772,229 @@ function ResourceEditor({name,state,onSave,onCancel}:{name:string;state?:Househo
   </form></article>;
 }
 
-const advisorResponses:Record<string,string>={
-  "What should I do first?":"Based on your household profile, your biggest preparedness gaps are evacuation planning and pet transportation. Complete these before lower-priority tasks.",
-  "Why is my score low?":"Your transportation readiness is strong, but your evacuation plan and emergency communication details are incomplete. Together, these account for 12 available points.",
-  "How can I prepare my children?":"Give each child an age-appropriate role, pack familiar comfort items, and practice your two exit routes together without creating alarm.",
-  "How do I prepare my pets?":"Keep carriers, leashes, medications, food, and identification together. Confirm that your planned shelter accepts pets before an emergency.",
-  "What should I pack before evacuation?":"Start with water, medications, identification, chargers, N95 masks, clothing, important documents, and supplies for children and pets.",
-};
-function Advisor() {
-  const [question,setQuestion]=useState("What should I do first?");
-  const { profile } = useHousehold();
-  const topGaps = analyzeHousehold(profile).gaps.slice(0, 2).map(g => g.title.toLowerCase());
-  const answers: Record<string, string> = { ...advisorResponses, "What should I do first?": topGaps.length ? `Based on your household profile, start with: ${topGaps.join(", then ")}. Complete these before lower-priority tasks.` : "Your household profile has no open gaps. Review supplies and practice your evacuation route every six months." };
-  return <div><PageTitle kicker="EVIDENCE-GROUNDED GUIDANCE" title="AI Readiness Advisor" copy="Personalized wildfire preparedness guidance based on your household profile, readiness score, and trusted emergency-preparedness sources."/>
-    <div className="grounded"><Icon name="shield"/> Grounded in your household profile + verified sources</div>
-    <div className="advisor-layout"><section className="card chat"><div className="advisor-intro"><div className="ai-mark"><Icon name="spark"/></div><div><b>ReadyCA Advisor</b><span>AI-assisted recommendation</span></div></div>
-      <div className="message user-message">{question}</div><div className="message ai-message"><p>{answers[question]}</p><div className="citation"><Icon name="shield" size={14}/> Sources: CAL FIRE, Ready.gov{profile.location.county ? `, ${countyLabel(profile)} OES` : ", Cal OES"}</div></div>
-      <div className="suggestions"><span>Ask a suggested question</span>{Object.keys(advisorResponses).map(q=><button className={q===question?"active":""} onClick={()=>setQuestion(q)} key={q}>{q}</button>)}</div>
-      <div className="chat-input"><span>Ask about your readiness plan...</span><button><Icon name="arrow"/></button></div>
-    </section><aside className="advisor-recs"><span className="kicker">RECOMMENDED FOR YOU</span><h2>Turn guidance into action</h2>{recommendations.slice(0,2).map(r=><article className="card advisor-card" key={r.title}><Badge tone="orange">{r.level.toUpperCase()}</Badge><h3>{r.title}</h3><div><span>Why this matters</span><p>{r.why}</p></div><div className="impact"><span>Estimated effort <b>{r.time}</b></span><span>Readiness impact <b>+{r.points} pts</b></span></div><div className="source"><Icon name="shield" size={14}/> Verified · {r.source}</div></article>)}</aside></div>
-    <div className="ai-disclaimer"><b>AI guidance is not an emergency alert.</b> ReadyCA uses AI to explain verified preparedness guidance, not to issue evacuation orders. Follow local authorities during an emergency.</div>
+// ---- Readiness Advisor: a guided chat over a curated question bank (lib/advisor.ts) ----
+
+type ChatMessage = { id: number; role: "user" | "ai"; text?: string; questionId?: string; answer?: AdvisorAnswer; fallback?: boolean };
+const FALLBACK_SUGGESTIONS = ["first", "missing", "score-calc"];
+
+function AdvisorReply({message,asked,onAsk,county}:{message:ChatMessage;asked:Set<string>;onAsk:(id:string)=>void;county:string}) {
+  const q = message.questionId ? QUESTION_BY_ID[message.questionId] : null;
+  // After an unmatched question, always offer something: unasked questions first, then the defaults.
+  const pool = q ? q.related : [...FALLBACK_SUGGESTIONS, ...ADVISOR_QUESTIONS.map(x => x.id)];
+  const unasked = [...new Set(pool)].filter(id => !asked.has(id));
+  const followUps = (q || unasked.length ? unasked : FALLBACK_SUGGESTIONS).slice(0, 3);
+  return <div className="message ai-message">
+    {message.fallback
+      ? <p>I don't have an answer for that yet. I can help with common questions about ReadyCA and your household plan, like these:</p>
+      : message.answer && <>{message.answer.paragraphs.map(p => <p key={p}>{p}</p>)}{message.answer.list && <ul>{message.answer.list.map(item => <li key={item}>{item}</li>)}</ul>}{message.answer.after?.map(p => <p key={p}>{p}</p>)}</>}
+    {q && <div className="citation"><Icon name="shield" size={14}/> {q.category === "Your plan" ? `Personalized from your household profile · CAL FIRE, Ready.gov${county ? `, ${county} OES` : ""}` : "ReadyCA preparedness guide"}</div>}
+    {followUps.length > 0 && <div className="follow-ups">{!message.fallback && <span>Related questions</span>}{followUps.map(id => <button key={id} onClick={() => onAsk(id)}>{QUESTION_BY_ID[id].question}</button>)}</div>}
   </div>;
 }
 
-function DecisionGame() {
-  const scenarios=[
-    {q:"A wildfire is spreading rapidly nearby. Local authorities issue an evacuation warning. What do you do first?", opts:["Wait until you can see smoke","Begin preparing and monitor official alerts","Drive toward the fire to see how close it is","Wait for neighbors to tell you"],correct:1,why:"An evacuation warning means prepare to leave now. Gathering your household, go-kit, and monitoring official updates reduces delay if an order follows."},
-    {q:"Smoke is reducing visibility and your primary route is congested. What is your safest next step?",opts:["Use your pre-planned backup route if officials say it is open","Take an unmarked dirt road","Stop to photograph the fire","Ignore official road closures"],correct:0,why:"A practiced backup route gives you a safer alternative, but you should still follow official traffic controls and closure information."},
-    {q:"Your family is separated when an evacuation order arrives. How should you reconnect?",opts:["Everyone returns home","Post your location publicly","Use your out-of-area contact and planned meeting point","Wait for cellular service to improve"],correct:2,why:"A shared meeting point and out-of-area contact reduce confusion when local networks are overloaded."},
-  ];
-  const [step,setStep]=useState(0), [selected,setSelected]=useState<number|null>(null), [points,setPoints]=useState(0);
+function Advisor({score}:{score:number}) {
+  const user = useCurrentUser();
+  const { profile } = useHousehold();
+  const [messages,setMessages]=useState<ChatMessage[]>([]);
+  const [typing,setTyping]=useState(false);
+  const [draft,setDraft]=useState("");
+  const [category,setCategory]=useState<AdvisorQuestion["category"]>("Your plan");
+  const nextId=useRef(1);
+  const replyTimer=useRef<number|undefined>(undefined);
+  const log=useRef<HTMLDivElement>(null);
+  const asked=new Set(messages.filter(m=>m.role==="ai"&&m.questionId).map(m=>m.questionId!));
+  const county=countyLabel(profile);
+
+  useEffect(()=>{log.current?.scrollTo({top:log.current.scrollHeight,behavior:"smooth"})},[messages,typing]);
+  useEffect(()=>()=>window.clearTimeout(replyTimer.current),[]);
+
+  const send=(userText:string,question:AdvisorQuestion|null)=>{
+    if(typing||!userText.trim())return;
+    const id=nextId.current; nextId.current+=2;
+    setMessages(m=>[...m,{id,role:"user",text:userText.trim()}]);
+    setTyping(true);
+    // Answer from the profile as it is when the question is asked, after a short "typing" pause.
+    const ctx={profile,score,firstName:user.firstName,signedIn:user.signedIn};
+    replyTimer.current=window.setTimeout(()=>{
+      setTyping(false);
+      setMessages(m=>[...m,question?{id:id+1,role:"ai",questionId:question.id,answer:question.answer(ctx)}:{id:id+1,role:"ai",fallback:true}]);
+    },650);
+  };
+  const ask=(questionId:string)=>{const q=QUESTION_BY_ID[questionId];send(q.question,q)};
+  const submit=()=>{send(draft,matchQuestion(draft));setDraft("")};
+
+  return <div><PageTitle kicker="EVIDENCE-GROUNDED GUIDANCE" title="AI Readiness Advisor" copy="Ask common questions about ReadyCA and get answers personalized to your household profile and readiness score."/>
+    <div className="grounded"><Icon name="shield"/> Grounded in your household profile + verified sources</div>
+    <div className="advisor-layout"><section className="card chat">
+      <div className="advisor-intro"><div className="ai-mark"><Icon name="spark"/></div><div><b>ReadyCA Advisor</b><span>Guided answers · personalized to your household</span></div>{messages.length>0&&<button className="text-button chat-clear" onClick={()=>{window.clearTimeout(replyTimer.current);setTyping(false);setMessages([])}}>Clear chat</button>}</div>
+      <div className="chat-log" ref={log} role="log" aria-live="polite" aria-label="Advisor conversation">
+        <div className="message ai-message"><p>Hi {user.firstName}! I answer common questions about ReadyCA and your household's wildfire plan. Choose a question below or type your own.</p></div>
+        {messages.map(m=>m.role==="user"?<div className="message user-message" key={m.id}>{m.text}</div>:<AdvisorReply key={m.id} message={m} asked={asked} onAsk={ask} county={county}/>)}
+        {typing&&<div className="message ai-message typing" aria-label="Advisor is typing"><i/><i/><i/></div>}
+      </div>
+      <div className="suggestions">
+        <div className="suggestion-tabs" role="tablist">{(["Your plan","About ReadyCA"] as const).map(c=><button role="tab" aria-selected={category===c} className={category===c?"active":""} onClick={()=>setCategory(c)} key={c}>{c==="About ReadyCA"?"Frequently asked":"Your plan"}</button>)}</div>
+        {ADVISOR_QUESTIONS.filter(q=>q.category===category).map(q=><button className={asked.has(q.id)?"asked":""} disabled={typing} onClick={()=>ask(q.id)} key={q.id}>{asked.has(q.id)&&<Icon name="check" size={11}/>}{q.question}</button>)}
+      </div>
+      <form className="chat-input" onSubmit={e=>{e.preventDefault();submit()}}><input value={draft} maxLength={200} placeholder="Ask about your readiness plan..." aria-label="Ask the advisor a question" onChange={e=>setDraft(e.target.value)}/><button type="submit" aria-label="Send" disabled={typing||!draft.trim()}><Icon name="arrow"/></button></form>
+    </section><aside className="advisor-recs"><span className="kicker">RECOMMENDED FOR YOU</span><h2>Turn guidance into action</h2>{recommendations.slice(0,2).map(r=><article className="card advisor-card" key={r.title}><Badge tone="orange">{r.level.toUpperCase()}</Badge><h3>{r.title}</h3><div><span>Why this matters</span><p>{r.why}</p></div><div className="impact"><span>Estimated effort <b>{r.time}</b></span><span>Readiness impact <b>+{r.points} pts</b></span></div><div className="source"><Icon name="shield" size={14}/> Verified · {r.source}</div></article>)}</aside></div>
+    <div className="ai-disclaimer"><b>Advisor answers are not emergency alerts.</b> They explain preparedness guidance and never replace evacuation orders. Follow local authorities during an emergency.</div>
+  </div>;
+}
+
+// ---- Emergency Decision Game: five practice modes (content in lib/games.ts) ----
+
+const GAME_MODES:{id:string;title:string;copy:string;icon:IconName}[]=[
+  {id:"scenarios",title:"Scenario Decisions",copy:"Make the right call as a fire approaches.",icon:"flame"},
+  {id:"bag",title:"Go-Bag Challenge",copy:"Pack the essentials with limited space.",icon:"box"},
+  {id:"steps",title:"Evacuation Steps",copy:"Put the evacuation steps in order.",icon:"route"},
+  {id:"myths",title:"Myth or Fact",copy:"Separate wildfire myths from facts.",icon:"help"},
+  {id:"alerts",title:"Alert Match",copy:"Match each alert to what it means.",icon:"bell"},
+];
+
+// Best scores are a per-browser convenience only, so storage failures are ignored.
+function loadBestScores():Record<string,number>{try{return JSON.parse(localStorage.getItem("readyca-game-best")??"{}")}catch{return {}}}
+
+function GameResult({score,total,onReplay,children}:{score:number;total:number;onReplay:()=>void;children?:ReactNode}) {
+  const pct=Math.round(score/total*100);
+  return <div className="game-result"><div className="game-result-score"><b>{score}</b><span>/ {total}</span></div><h2>{pct===100?"Perfect score!":pct>=70?"Strong preparedness":"Keep practicing"}</h2><p>{pct===100?"You know exactly what to do.":pct>=70?"You got most of these right. Review the ones you missed.":"Each round builds the instincts you'll need. Review the explanations and try again."}</p>{children}<Button onClick={onReplay}>Play again <Icon name="arrow"/></Button></div>;
+}
+
+function ScenarioGame({onFinish}:{onFinish:(score:number,total:number)=>void}) {
+  const [step,setStep]=useState(0),[selected,setSelected]=useState<number|null>(null),[points,setPoints]=useState(0),[done,setDone]=useState(false);
   const [timed,setTimed]=useState(false),[seconds,setSeconds]=useState(30);
-  useEffect(()=>{if(!timed||selected!==null)return;const timer=window.setInterval(()=>setSeconds(s=>{if(s<=1){window.clearInterval(timer);setSelected(-1);return 0}return s-1}),1000);return()=>window.clearInterval(timer)},[timed,selected,step]);
-  const pick=(i:number)=>{if(selected!==null)return;setSelected(i);if(i===scenarios[step].correct)setPoints(p=>p+1)};
-  const next=()=>{setSeconds(30);if(step<scenarios.length-1){setStep(s=>s+1);setSelected(null)}else{setStep(0);setSelected(null);setPoints(0)}};
-  const s=scenarios[step];
-  return <div className="game-page"><PageTitle kicker="PRACTICE UNDER PRESSURE" title="Wildfire Ready: Emergency Decision Game" copy="A wildfire is approaching your community. What would you do?"/>
-    <section className={`card game-card pressure-${Math.ceil(seconds/10)}`}><div className="smoke-layer"/><div className="game-top"><div><Badge tone="orange">SCENARIO {String(step+1).padStart(2,"0")}</Badge><Badge tone="gray">{step===0?"FOUNDATION":step===1?"INTERMEDIATE":"ADVANCED"}</Badge></div><div className="timer-control"><button className={timed?"on":""} onClick={()=>{setTimed(!timed);setSeconds(30)}}><Icon name="clock" size={14}/> Time pressure {timed?"on":"off"}</button>{timed&&<span className={seconds<=10?"urgent":""}>{seconds}s</span>}<span>Score: <b>{points} / {step+(selected!==null?1:0)}</b></span></div></div><div className="scenario-map"><div className="scenario-fire"><Icon name="flame"/><i/></div><div className="scenario-home"><Icon name="home"/></div><div className="scenario-road"/></div><div className="scenario-progress">{scenarios.map((_,i)=><i className={i<=step?"active":""} key={i}/>)}</div><h2>{s.q}</h2><div className="answers">{s.opts.map((o,i)=><button className={selected===null?"":i===s.correct?"correct":i===selected?"wrong":"dim"} onClick={()=>pick(i)} key={o}><span>{String.fromCharCode(65+i)}</span><b>{o}</b>{selected!==null&&i===s.correct&&<Icon name="check"/>}</button>)}</div>
-      {selected!==null&&<div className={`explanation ${selected===s.correct?"correct":"review"}`}><div><Icon name={selected===s.correct?"check":"help"}/></div><div><b>{selected===s.correct?"Correct":selected===-1?"Time expired — review the safest action":"Good practice — review this choice"}</b><h3>Preparedness principle</h3><p>{s.why}</p><div className="source"><Icon name="shield" size={14}/> Verified principle · CAL FIRE Ready for Wildfire</div></div></div>}
-      <div className="game-actions"><span>Preparedness level: <b>{points>=2?"Strong":"Building"}</b></span><Button onClick={next} disabled={selected===null}>{step===scenarios.length-1?"See final score":"Next scenario"} <Icon name="arrow"/></Button></div>
-    </section>
+  useEffect(()=>{if(!timed||selected!==null||done)return;const timer=window.setInterval(()=>setSeconds(s=>{if(s<=1){window.clearInterval(timer);setSelected(-1);return 0}return s-1}),1000);return()=>window.clearInterval(timer)},[timed,selected,step,done]);
+  const s=SCENARIOS[step];
+  const pick=(i:number)=>{if(selected!==null)return;setSelected(i);if(i===s.correct)setPoints(p=>p+1)};
+  const next=()=>{setSeconds(30);if(step<SCENARIOS.length-1){setStep(x=>x+1);setSelected(null)}else{setDone(true);onFinish(points,SCENARIOS.length)}};
+  const replay=()=>{setStep(0);setSelected(null);setPoints(0);setSeconds(30);setDone(false)};
+  if(done)return <section className="card game-card"><GameResult score={points} total={SCENARIOS.length} onReplay={replay}/></section>;
+  return <section className={`card game-card pressure-${Math.ceil(seconds/10)}`}><div className="smoke-layer"/><div className="game-top"><div><Badge tone="orange">SCENARIO {String(step+1).padStart(2,"0")}</Badge><Badge tone="gray">{s.level.toUpperCase()}</Badge></div><div className="timer-control"><button className={timed?"on":""} onClick={()=>{setTimed(!timed);setSeconds(30)}}><Icon name="clock" size={14}/> Time pressure {timed?"on":"off"}</button>{timed&&<span className={seconds<=10?"urgent":""}>{seconds}s</span>}<span>Score: <b>{points} / {step+(selected!==null?1:0)}</b></span></div></div><div className="scenario-map"><div className="scenario-fire"><Icon name="flame"/><i/></div><div className="scenario-home"><Icon name="home"/></div><div className="scenario-road"/></div><div className="scenario-progress">{SCENARIOS.map((_,i)=><i className={i<=step?"active":""} key={i}/>)}</div><h2>{s.q}</h2><div className="answers">{s.opts.map((o,i)=><button className={selected===null?"":i===s.correct?"correct":i===selected?"wrong":"dim"} onClick={()=>pick(i)} key={o}><span>{String.fromCharCode(65+i)}</span><b>{o}</b>{selected!==null&&i===s.correct&&<Icon name="check"/>}</button>)}</div>
+    {selected!==null&&<div className={`explanation ${selected===s.correct?"correct":"review"}`}><div><Icon name={selected===s.correct?"check":"help"}/></div><div><b>{selected===s.correct?"Correct":selected===-1?"Time expired — review the safest action":"Good practice — review this choice"}</b><h3>Preparedness principle</h3><p>{s.why}</p><div className="source"><Icon name="shield" size={14}/> Verified principle · CAL FIRE Ready for Wildfire</div></div></div>}
+    <div className="game-actions"><span>Preparedness level: <b>{points>=Math.ceil(SCENARIOS.length*0.7)?"Strong":"Building"}</b></span><Button onClick={next} disabled={selected===null}>{step===SCENARIOS.length-1?"See final score":"Next scenario"} <Icon name="arrow"/></Button></div>
+  </section>;
+}
+
+function GoBagGame({onFinish}:{onFinish:(score:number,total:number)=>void}) {
+  const { profile } = useHousehold();
+  const [round,setRound]=useState(0);
+  const items=useMemo(()=>shuffle(bagItems(profile)),[profile,round]);
+  const slots=items.filter(i=>i.essential).length;
+  const [packed,setPacked]=useState<string[]>([]);
+  const [checked,setChecked]=useState(false);
+  const score=items.filter(i=>i.essential&&packed.includes(i.name)).length;
+  const toggle=(name:string)=>{if(checked)return;setPacked(p=>p.includes(name)?p.filter(x=>x!==name):p.length<slots?[...p,name]:p)};
+  const check=()=>{setChecked(true);onFinish(score,slots)};
+  const replay=()=>{setPacked([]);setChecked(false);setRound(r=>r+1)};
+  const missed=items.filter(i=>i.essential&&!packed.includes(i.name));
+  return <section className="card game-card">
+    <div className="game-top"><div><Badge tone="orange">GO-BAG CHALLENGE</Badge><Badge tone="gray">{plural(slots,"slot")}</Badge></div><span>Packed: <b>{packed.length} / {slots}</b></span></div>
+    <h2>An evacuation warning was just issued. Your bag has room for {slots} items. What do you pack?</h2>
+    <p className="game-hint">Items marked for your household appear when your profile includes pets, children, or support needs.</p>
+    <div className="answers bag-grid">{items.map(item=>{
+      const isPacked=packed.includes(item.name);
+      const cls=!checked?(isPacked?"packed":""):item.essential?(isPacked?"correct":"missed"):isPacked?"wrong":"dim";
+      return <button className={cls} onClick={()=>toggle(item.name)} aria-pressed={isPacked} disabled={!checked&&!isPacked&&packed.length>=slots} key={item.name}><span>{isPacked?<Icon name="check" size={14}/>:<Icon name="box" size={14}/>}</span><b>{item.name}{checked&&<small>{item.why}</small>}</b></button>;
+    })}</div>
+    {checked?<GameResult score={score} total={slots} onReplay={replay}>{missed.length>0&&<div className="explanation review"><div><Icon name="help"/></div><div><b>Essentials you left behind</b>{missed.map(m=><p key={m.name}><b>{m.name}:</b> {m.why}</p>)}</div></div>}</GameResult>
+      :<div className="game-actions"><span>{packed.length<slots?`${plural(slots-packed.length,"slot")} left`:"Bag full"}</span><Button onClick={check} disabled={packed.length===0}>Check my bag <Icon name="arrow"/></Button></div>}
+  </section>;
+}
+
+function StepsGame({onFinish}:{onFinish:(score:number,total:number)=>void}) {
+  const [round,setRound]=useState(0);
+  const pool=useMemo(()=>shuffle(EVACUATION_STEPS.map(s=>s.step)),[round]);
+  const [order,setOrder]=useState<string[]>([]);
+  const [checked,setChecked]=useState(false);
+  const correctAt=(i:number)=>order[i]===EVACUATION_STEPS[i].step;
+  const score=order.filter((_,i)=>correctAt(i)).length;
+  const check=()=>{setChecked(true);onFinish(score,EVACUATION_STEPS.length)};
+  const replay=()=>{setOrder([]);setChecked(false);setRound(r=>r+1)};
+  return <section className="card game-card">
+    <div className="game-top"><div><Badge tone="orange">EVACUATION STEPS</Badge><Badge tone="gray">ORDERING</Badge></div><span>Placed: <b>{order.length} / {EVACUATION_STEPS.length}</b></span></div>
+    <h2>An evacuation warning is issued for your neighborhood. Put these steps in the recommended order.</h2>
+    <div className="steps-layout">
+      <div><span className="kicker">YOUR PLAN</span><ol className="step-order">{EVACUATION_STEPS.map((_,i)=>{const item=order[i];return <li key={i} className={!item?"empty":checked?(correctAt(i)?"correct":"wrong"):""}><span>{i+1}</span>{item?<button disabled={checked} onClick={()=>setOrder(o=>o.filter(x=>x!==item))} aria-label={`Remove ${item}`}>{item}{!checked&&<Icon name="close" size={12}/>}</button>:<em>Select a step</em>}</li>})}</ol></div>
+      <div><span className="kicker">STEPS</span><div className="step-pool">{pool.filter(s=>!order.includes(s)).map(s=><button key={s} onClick={()=>setOrder(o=>[...o,s])}>{s}</button>)}{order.length===EVACUATION_STEPS.length&&!checked&&<p className="game-hint">All steps placed. Select a step in your plan to move it back.</p>}</div></div>
+    </div>
+    {checked?<GameResult score={score} total={EVACUATION_STEPS.length} onReplay={replay}><div className="explanation correct"><div><Icon name="route"/></div><div><b>Recommended order</b>{EVACUATION_STEPS.map((s,i)=><p key={s.step}><b>{i+1}. {s.step}.</b> {s.why}</p>)}<div className="source"><Icon name="shield" size={14}/> CAL FIRE Ready, Set, Go!</div></div></div></GameResult>
+      :<div className="game-actions"><span>Select steps in the order you'd do them.</span><Button onClick={check} disabled={order.length<EVACUATION_STEPS.length}>Check my order <Icon name="arrow"/></Button></div>}
+  </section>;
+}
+
+function MythGame({onFinish}:{onFinish:(score:number,total:number)=>void}) {
+  const [round,setRound]=useState(0);
+  const deck=useMemo(()=>shuffle(MYTHS),[round]);
+  const [index,setIndex]=useState(0),[answer,setAnswer]=useState<boolean|null>(null),[points,setPoints]=useState(0),[streak,setStreak]=useState(0),[done,setDone]=useState(false);
+  const card=deck[index];
+  const pick=(fact:boolean)=>{if(answer!==null)return;setAnswer(fact);if(fact===card.fact){setPoints(p=>p+1);setStreak(s=>s+1)}else setStreak(0)};
+  const next=()=>{if(index<deck.length-1){setIndex(i=>i+1);setAnswer(null)}else{setDone(true);onFinish(points,deck.length)}};
+  const replay=()=>{setRound(r=>r+1);setIndex(0);setAnswer(null);setPoints(0);setStreak(0);setDone(false)};
+  if(done)return <section className="card game-card"><GameResult score={points} total={deck.length} onReplay={replay}/></section>;
+  const right=answer!==null&&answer===card.fact;
+  return <section className="card game-card">
+    <div className="game-top"><div><Badge tone="orange">MYTH OR FACT</Badge><Badge tone="gray">{index+1} OF {deck.length}</Badge></div><span>Score: <b>{points}</b>{streak>=2&&<> · Streak <b>{streak}</b></>}</span></div>
+    <div className="scenario-progress">{deck.map((_,i)=><i className={i<=index?"active":""} key={i}/>)}</div>
+    <h2>“{card.statement}”</h2>
+    <div className="answers myth-answers">{[false,true].map(fact=><button key={String(fact)} className={answer===null?"":fact===card.fact?"correct":fact===answer?"wrong":"dim"} onClick={()=>pick(fact)}><span>{fact?"F":"M"}</span><b>{fact?"Fact":"Myth"}</b>{answer!==null&&fact===card.fact&&<Icon name="check"/>}</button>)}</div>
+    {answer!==null&&<div className={`explanation ${right?"correct":"review"}`}><div><Icon name={right?"check":"help"}/></div><div><b>{right?"Correct":"Not quite"} — it's a {card.fact?"fact":"myth"}</b><p>{card.why}</p></div></div>}
+    <div className="game-actions"><span>Answer quickly to build a streak.</span><Button onClick={next} disabled={answer===null}>{index===deck.length-1?"See final score":"Next statement"} <Icon name="arrow"/></Button></div>
+  </section>;
+}
+
+function AlertMatchGame({onFinish}:{onFinish:(score:number,total:number)=>void}) {
+  const [round,setRound]=useState(0);
+  const meanings=useMemo(()=>shuffle(ALERTS.map(a=>a.meaning)),[round]);
+  const terms=useMemo(()=>shuffle(ALERTS.map(a=>a.term)),[round]);
+  const [selected,setSelected]=useState<string|null>(null);
+  const [matched,setMatched]=useState<string[]>([]);
+  const [missed,setMissed]=useState<string[]>([]); // terms matched wrong at least once
+  const [wrongFlash,setWrongFlash]=useState<string|null>(null);
+  const done=matched.length===ALERTS.length;
+  const score=ALERTS.length-missed.length;
+  const choose=(meaning:string)=>{
+    if(!selected||done)return;
+    if(ALERTS.find(a=>a.term===selected)?.meaning===meaning){
+      const next=[...matched,selected];setMatched(next);setSelected(null);
+      if(next.length===ALERTS.length)onFinish(ALERTS.length-missed.length,ALERTS.length);
+    }else{
+      if(!missed.includes(selected))setMissed(m=>[...m,selected]);
+      setWrongFlash(meaning);window.setTimeout(()=>setWrongFlash(null),600);
+    }
+  };
+  const replay=()=>{setRound(r=>r+1);setSelected(null);setMatched([]);setMissed([]);setWrongFlash(null)};
+  const termFor=(meaning:string)=>ALERTS.find(a=>a.meaning===meaning)!.term;
+  return <section className="card game-card">
+    <div className="game-top"><div><Badge tone="orange">ALERT MATCH</Badge><Badge tone="gray">KNOW YOUR ALERTS</Badge></div><span>Matched: <b>{matched.length} / {ALERTS.length}</b></span></div>
+    <h2>Select an alert, then select what it means.</h2>
+    <div className="match-grid">
+      <div className="match-col">{terms.map(t=><button key={t} className={matched.includes(t)?"correct":selected===t?"selected":""} disabled={matched.includes(t)||done} onClick={()=>setSelected(t)} aria-pressed={selected===t}>{matched.includes(t)&&<Icon name="check" size={14}/>}{t}</button>)}</div>
+      <div className="match-col meanings">{meanings.map(m=>{const isMatched=matched.includes(termFor(m));return <button key={m} className={isMatched?"correct":wrongFlash===m?"wrong":""} disabled={isMatched||!selected||done} onClick={()=>choose(m)}>{isMatched&&<b>{termFor(m)}: </b>}{m}</button>})}</div>
+    </div>
+    {done?<GameResult score={score} total={ALERTS.length} onReplay={replay}><p className="game-hint">Score counts alerts matched correctly on the first try. Sign up for your county's official alerts so you get warnings and orders directly.</p></GameResult>
+      :<div className="game-actions"><span>{selected?`Now select what “${selected}” means.`:"Select an alert to start."}</span></div>}
+  </section>;
+}
+
+function DecisionGame() {
+  const [mode,setMode]=useState("scenarios");
+  const [best,setBest]=useState<Record<string,number>>(loadBestScores);
+  const finish=(id:string)=>(score:number,total:number)=>{
+    const pct=Math.round(score/total*100);
+    setBest(current=>{
+      if((current[id]??-1)>=pct)return current;
+      const next={...current,[id]:pct};
+      try{localStorage.setItem("readyca-game-best",JSON.stringify(next))}catch{/* best scores are optional */}
+      return next;
+    });
+  };
+  return <div className="game-page"><PageTitle kicker="PRACTICE UNDER PRESSURE" title="Wildfire Ready: Emergency Decision Game" copy="Build the instincts you'll need when a wildfire approaches. Choose a game mode."/>
+    <div className="game-modes" role="tablist">{GAME_MODES.map(m=><button role="tab" aria-selected={mode===m.id} className={mode===m.id?"active":""} onClick={()=>setMode(m.id)} key={m.id}><span className="game-mode-icon"><Icon name={m.icon}/></span><b>{m.title}</b><small>{m.copy}</small>{best[m.id]!=null&&<em>Best: {best[m.id]}%</em>}</button>)}</div>
+    {mode==="scenarios"&&<ScenarioGame onFinish={finish("scenarios")}/>}
+    {mode==="bag"&&<GoBagGame onFinish={finish("bag")}/>}
+    {mode==="steps"&&<StepsGame onFinish={finish("steps")}/>}
+    {mode==="myths"&&<MythGame onFinish={finish("myths")}/>}
+    {mode==="alerts"&&<AlertMatchGame onFinish={finish("alerts")}/>}
   </div>;
 }
 
