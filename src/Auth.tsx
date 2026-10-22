@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { supabase, supabaseConfigured } from "./lib/supabase";
+import logo from "./assets/CAReady128x.png";
 
 function Auth({ initialMode = "signin", onBack }: { initialMode?: "signin" | "signup"; onBack: () => void }) {
   const [mode, setMode] = useState(initialMode);
@@ -29,7 +30,7 @@ function Auth({ initialMode = "signin", onBack }: { initialMode?: "signin" | "si
 
   return <div className="auth-page">
     <form className="auth-card" onSubmit={submit}>
-      <div className="brand"><div className="brand-mark">🔥</div><div><b>ReadyCA</b><small>WILDFIRE READINESS</small></div></div>
+      <div className="brand"><img className="brand-mark brand-logo" src={logo} alt="" width={38} height={38}/><div><b>ReadyCA</b><small>WILDFIRE READINESS</small></div></div>
       <h1>{mode === "signin" ? "Welcome back" : "Create your account"}</h1>
       <p>{mode === "signin" ? "Sign in to pick up your readiness plan where you left off." : "Save your household plan and progress across devices."}</p>
       {!supabaseConfigured && <div className="auth-message error">Login isn't connected yet. Add your Supabase URL and anon key to <code>.env.local</code> and restart the dev server.</div>}

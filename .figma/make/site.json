@@ -1,5 +1,8 @@
 {
   "description": "Empowering California residents with personalized wildfire preparedness tools, this app helps users assess risks, improve readiness, and create effective emergency plans.",
+  "icons": {
+    "icon": "/favicon.ico"
+  },
   "robots": {
     "index": false
   },

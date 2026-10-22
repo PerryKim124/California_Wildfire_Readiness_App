@@ -9,6 +9,7 @@ import {
 } from "./lib/household";
 import { ADVISOR_QUESTIONS, QUESTION_BY_ID, matchQuestion, type AdvisorAnswer, type AdvisorQuestion } from "./lib/advisor";
 import { ALERTS, EVACUATION_STEPS, MYTHS, SCENARIOS, bagItems, shuffle } from "./lib/games";
+import logo from "./assets/CAReady128x.png";
 import Auth from "./Auth";
 import "./enhancements.css";
 
@@ -47,6 +48,11 @@ const iconPaths: Record<IconName, ReactNode> = {
   external: <><path d="M14 3h7v7M21 3l-9 9"/><path d="M18 13v7H4V6h7"/></>,
   download: <><path d="M12 3v12m-5-5 5 5 5-5"/><path d="M5 21h14"/></>,
 };
+
+// ReadyCA logo. Decorative: it always sits next to the "ReadyCA" wordmark.
+function BrandMark() {
+  return <img className="brand-mark brand-logo" src={logo} alt="" width={38} height={38}/>;
+}
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{iconPaths[name]}</svg>;
@@ -229,7 +235,7 @@ function App() {
 
   return withContext(<div className="app">
     <aside className={`sidebar ${menuOpen ? "open" : ""}`}>
-      <div className="brand" onClick={() => go("Dashboard")}><div className="brand-mark"><Icon name="flame" size={20}/></div><div><b>ReadyCA</b><small>WILDFIRE READINESS</small></div></div>
+      <div className="brand" onClick={() => go("Dashboard")}><BrandMark/><div><b>ReadyCA</b><small>WILDFIRE READINESS</small></div></div>
       <nav>{nav.map(([label, icon]) => <button key={label} className={active === label ? "active" : ""} onClick={() => go(label)}><Icon name={icon}/><span>{label}</span>{active === label && <i/>}</button>)}</nav>
       <div className="sidebar-foot"><Icon name="shield"/><div><b>Emergency guidance</b><span>Follow official local authority instructions. Call 911 for life-threatening emergencies.</span></div></div>
     </aside>
@@ -271,7 +277,7 @@ function App() {
 
 function Landing({onStart,onSignIn,onExplore}:{onStart:()=>void;onSignIn:()=>void;onExplore:()=>void}) {
   return <div className="landing">
-    <header className="landing-header"><div className="brand"><div className="brand-mark"><Icon name="flame"/></div><div><b>ReadyCA</b><small>WILDFIRE READINESS</small></div></div><div><button className="text-button">How it works</button><button className="text-button">Preparedness resources</button><Button variant="secondary" onClick={onSignIn}>Sign in</Button></div></header>
+    <header className="landing-header"><div className="brand"><BrandMark/><div><b>ReadyCA</b><small>WILDFIRE READINESS</small></div></div><div><button className="text-button">How it works</button><button className="text-button">Preparedness resources</button><Button variant="secondary" onClick={onSignIn}>Sign in</Button></div></header>
     <main className="landing-main"><section className="landing-copy"><Badge tone="orange"><span className="status-dot"/> BUILT FOR CALIFORNIA HOUSEHOLDS</Badge><h1>Be ready before wildfire conditions change.</h1><p>Understand your household's readiness, build a clear evacuation plan, and take the next best step with guidance grounded in trusted emergency sources.</p><div className="landing-actions"><Button onClick={onStart}>Build my readiness plan <Icon name="arrow"/></Button><Button variant="secondary" onClick={onExplore}>Explore the dashboard</Button></div><div className="trust-row"><span><Icon name="shield"/> Evidence-grounded</span><span><Icon name="check"/> Transparent scoring</span><span><Icon name="pin"/> Location-aware</span></div></section>
     <section className="landing-preview"><div className="preview-alert"><span><Icon name="flame"/></span><div><small>LOCAL WILDFIRE RISK</small><b>Moderate</b><p>No active evacuation order near your location.</p></div></div><div className="preview-score"><ScoreRing score={72}/><div><Badge>GOOD PREPAREDNESS</Badge><h2>Your household has a good start.</h2><p>Complete your evacuation plan to improve your score by 8 points.</p><div className="progress"><i style={{width:"72%"}}/></div></div></div><div className="preview-actions"><span><Icon name="route"/> Create evacuation plan <b>+8</b></span><span><Icon name="box"/> Prepare 72-hour kit <b>+6</b></span></div></section></main>
     <footer className="landing-footer"><span><Icon name="shield"/> In an emergency, follow official local instructions. Call 911 for life-threatening emergencies.</span><span>Guidance informed by CAL FIRE · Cal OES · FEMA · Ready.gov</span></footer>
@@ -296,7 +302,7 @@ function HouseholdSetup({onComplete}:{onComplete:()=>void}) {
     if(step===3)update(p=>({...p,meetingPoint:tidy(meetingPoint)}));
     if(step<steps.length-1)setStep(step+1); else onComplete();
   };
-  return <div className="setup-page"><header><div className="brand"><div className="brand-mark"><Icon name="flame"/></div><div><b>ReadyCA</b><small>HOUSEHOLD SETUP</small></div></div><button className="text-button" onClick={()=>{if(step===3)update(p=>({...p,meetingPoint:tidy(meetingPoint)}));onComplete()}}>Save & finish later</button></header><main><div className="setup-progress"><span>STEP {step+1} OF {steps.length}</span><div>{steps.map((_,i)=><i className={i<=step?"active":""} key={i}/>)}</div></div><Badge tone="blue">USER-PROVIDED INFORMATION</Badge><h1>{title}</h1><p>{copy} You can update these details at any time.</p>
+  return <div className="setup-page"><header><div className="brand"><BrandMark/><div><b>ReadyCA</b><small>HOUSEHOLD SETUP</small></div></div><button className="text-button" onClick={()=>{if(step===3)update(p=>({...p,meetingPoint:tidy(meetingPoint)}));onComplete()}}>Save & finish later</button></header><main><div className="setup-progress"><span>STEP {step+1} OF {steps.length}</span><div>{steps.map((_,i)=><i className={i<=step?"active":""} key={i}/>)}</div></div><Badge tone="blue">USER-PROVIDED INFORMATION</Badge><h1>{title}</h1><p>{copy} You can update these details at any time.</p>
     <div className="setup-body">
       {step===0&&<LocationForm autoSave/>}
       {step===1&&<>
@@ -1034,7 +1040,7 @@ function Report({score}:{score:number}) {
   if(!generated)return <div><PageTitle kicker="PERSONALIZED SUMMARY" title="Your Family Preparedness Report" copy="Turn your profile and readiness progress into a clear, shareable household action plan."/><section className="card report-hero"><div className="report-illustration"><Icon name="file" size={48}/><i/></div><Badge tone="blue">AI-ASSISTED · EVIDENCE-GROUNDED</Badge><h2>A practical plan your whole family can use</h2><p>Your report summarizes strengths, priority gaps, evacuation planning, household needs, and next steps — with a verified source for every recommendation.</p><div className="report-features"><span><Icon name="check"/> Household-specific</span><span><Icon name="check"/> Source-linked</span><span><Icon name="check"/> Easy to share</span></div><Button onClick={generate} disabled={loading}>{loading?<><span className="spinner"/> Generating your report...</>:"Generate Report"}</Button><small>Uses your {a.completeness}% complete household profile. You can update it anytime.</small></section></div>;
   return <div><PageTitle kicker="GENERATED JUST NOW" title="Your Family Preparedness Report" copy={`Personalized for ${household} · ${county}`}/>
     <div className="report-actions"><Button variant="secondary" icon="download">Download Report</Button><Button variant="secondary">Share Report</Button><Button>Update My Plan</Button></div>
-    <section className="report-doc"><div className="report-cover"><div className="brand"><div className="brand-mark"><Icon name="flame"/></div><b>ReadyCA</b></div><span>HOUSEHOLD READINESS</span><div className="report-score">{score}<small>/ 100</small></div><Badge>GOOD PREPAREDNESS</Badge><p>Prepared for {household}<br/>{locationLong(profile)}</p></div>
+    <section className="report-doc"><div className="report-cover"><div className="brand"><BrandMark/><b>ReadyCA</b></div><span>HOUSEHOLD READINESS</span><div className="report-score">{score}<small>/ 100</small></div><Badge>GOOD PREPAREDNESS</Badge><p>Prepared for {household}<br/>{locationLong(profile)}</p></div>
     <div className="report-body"><h2>Executive Summary</h2><p>{summary}</p><div className="report-cols"><div><span className="kicker">STRENGTHS</span>{strengths.map(x=><p key={x}><Icon name="check" size={16}/>{x}</p>)}</div><div><span className="kicker">PRIORITY GAPS</span>{priorityGaps.length?priorityGaps.map(x=><p key={x}><i/> {x}</p>):<p><Icon name="check" size={16}/>No open gaps</p>}</div></div>
     <h2>Household Readiness Analytics</h2><div className="report-analytics"><div className="radar-card"><svg viewBox="0 0 180 160"><g className="radar-grid"><polygon points="90,12 160,55 135,140 45,140 20,55"/><polygon points="90,36 137,65 120,120 60,120 43,65"/><line x1="90" y1="12" x2="90" y2="82"/><line x1="160" y1="55" x2="90" y2="82"/><line x1="135" y1="140" x2="90" y2="82"/><line x1="45" y1="140" x2="90" y2="82"/><line x1="20" y1="55" x2="90" y2="82"/></g><polygon className="radar-value" points="90,27 147,60 126,126 65,112 38,62"/><g className="radar-points">{[[90,27],[147,60],[126,126],[65,112],[38,62]].map(([x,y])=><circle cx={x} cy={y} r="3" key={x}/>)}</g></svg><div className="radar-labels"><span>Evacuation</span><span>Transport</span><span>Supplies</span><span>Pets</span><span>Communication</span></div></div><div className="projection-card"><span className="kicker">PROJECTED READINESS</span><div><b>{score}</b><Icon name="arrow"/><strong>93</strong></div><p>Complete your top three recommended actions to gain a projected <b>+21 points.</b></p><div className="mini-trend"><i/><i/><i/><i/><i/></div></div><div className="resource-matrix"><span className="kicker">RESOURCE COMPLETENESS</span>{RESOURCE_CATALOG.map(c=>[c.name.split(" ")[0],Math.round(c.items.filter(i=>profile.resources[i.name]?.status==="ready").length/c.items.length*100)] as [string,number]).map(([n,v])=><div key={n}><span>{n}</span><div className="progress"><i style={{width:`${v}%`}}/></div><b>{v}%</b></div>)}</div><div className="exposure-card"><span className="kicker">LOCAL RISK EXPOSURE</span><div className="exposure-map"><i/><span>HOME</span><b>MODERATE</b></div><small>No active evacuation order · {county}</small></div></div>
     <h2>Top 3 actions for fastest improvement</h2><div className="top-actions">{recommendations.slice(0,3).map((r,i)=><span key={r.title}><i>{i+1}</i>{r.title}<b>+{r.points}</b></span>)}</div><h2>Recommended Action Plan</h2>{recommendations.map((r,i)=><div className="action-line" key={r.title}><span>{i+1}</span><div><b>{r.title}</b><small>{r.level} · {r.time} · Supporting source: {r.source}</small></div><strong>+{r.points} pts</strong></div>)}</div></section>

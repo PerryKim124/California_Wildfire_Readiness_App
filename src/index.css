@@ -130,3 +130,6 @@ button.network-node{font:inherit;text-align:left;cursor:pointer;border-style:das
 .match-col.meanings button{display:block}
 .ai-message ul{list-style:disc}.ai-message li::marker{color:var(--green)}
 .advisor-intro .chat-clear{white-space:nowrap}
+
+/* ReadyCA logo image (replaces the placeholder flame mark) */
+.brand-mark.brand-logo{display:block;background:none;box-shadow:none;border-radius:0;object-fit:contain;flex:none}
